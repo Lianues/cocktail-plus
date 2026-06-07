@@ -27,6 +27,7 @@ export function makeRequestContext(req, options = {}) {
         protocol,
         host,
         headers: {
+            authorization: req.headers?.authorization,
             cookie: req.headers?.cookie,
             'x-csrf-token': req.headers?.['x-csrf-token'],
             'content-type': req.headers?.['content-type'] || 'application/json',

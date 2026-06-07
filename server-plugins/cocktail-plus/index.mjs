@@ -22,7 +22,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.5";
+  return "0.1.6";
 }
 var VERSION = readVersion();
 var info = {
@@ -376,6 +376,7 @@ function makeRequestContext(req, options = {}) {
     protocol,
     host,
     headers: {
+      authorization: req.headers?.authorization,
       cookie: req.headers?.cookie,
       "x-csrf-token": req.headers?.["x-csrf-token"],
       "content-type": req.headers?.["content-type"] || "application/json",
