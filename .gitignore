@@ -1,0 +1,4 @@
+deploy-to-sillytavern.bat
+node_modules
+docs
+scripts/deploy-to-sillytavern.ps1

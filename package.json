@@ -1,0 +1,19 @@
+{
+  "name": "cocktail-plus",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:client && npm run build:server",
+    "build:client": "vite build",
+    "build:server": "esbuild server-plugins/cocktail-plus/src/index.ts --bundle --platform=node --format=esm --target=node18 --outfile=server-plugins/cocktail-plus/index.mjs",
+    "check": "tsc --noEmit",
+    "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy-to-sillytavern.ps1"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.84",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0",
+    "vite": "^6.0.0"
+  }
+}
