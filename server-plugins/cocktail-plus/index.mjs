@@ -22,7 +22,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.9";
+  return "0.1.10";
 }
 var VERSION = readVersion();
 var info = {
@@ -90,7 +90,10 @@ var DEFAULT_CONFIG = Object.freeze({
   patchI18nInit: true,
   patchSystemMessagesInit: true,
   patchExtensionManifests: true,
-  patchParallelActivateExtensions: true
+  patchParallelActivateExtensions: true,
+  // Optional ST source hotfix. When enabled, plugin patches src/endpoints/chats.js on startup;
+  // a restart is still required for the patched source to be loaded by SillyTavern.
+  autoPatchChatsEnoentGuard: false
 });
 function asBool(value, fallback = false) {
   if (typeof value === "boolean") return value;
@@ -151,6 +154,7 @@ function normalizeConfig(input = {}) {
   out.patchSystemMessagesInit = asBool(input.patchSystemMessagesInit, DEFAULT_CONFIG.patchSystemMessagesInit);
   out.patchExtensionManifests = asBool(input.patchExtensionManifests, DEFAULT_CONFIG.patchExtensionManifests);
   out.patchParallelActivateExtensions = asBool(input.patchParallelActivateExtensions, DEFAULT_CONFIG.patchParallelActivateExtensions);
+  out.autoPatchChatsEnoentGuard = asBool(input.autoPatchChatsEnoentGuard, DEFAULT_CONFIG.autoPatchChatsEnoentGuard);
   return out;
 }
 function loadConfig() {
@@ -3553,8 +3557,8 @@ function autoEnsureEarlyBridge() {
 }
 
 // server-plugins/cocktail-plus/src/routes.ts
-import fs12 from "node:fs";
-import path11 from "node:path";
+import fs13 from "node:fs";
+import path12 from "node:path";
 
 // server-plugins/cocktail-plus/src/fast-handler.ts
 function makeEntryFromBody(ctx, endpointKey, status, statusText, headers, bodyText, signature, durationMs, transform = null) {
@@ -4789,6 +4793,135 @@ async function handleModuleProxy(req, res) {
   }
 }
 
+// server-plugins/cocktail-plus/src/source-patches.ts
+import fs12 from "node:fs";
+import path11 from "node:path";
+var CHAT_INFO_ENOENT_SENTINEL = "Chat file no longer exists, skipping";
+var CHAT_STREAM_ENOENT_SENTINEL = "Chat file disappeared while reading, skipping";
+var ORIGINAL_STAT_LINE = `        const stats = await fs.promises.stat(pathToFile);`;
+var PATCHED_STAT_BLOCK = `        let stats;
+        try {
+            stats = await fs.promises.stat(pathToFile);
+        } catch (error) {
+            if (error?.code === 'ENOENT') {
+                console.debug(\`Chat file no longer exists, skipping: \${pathToFile}\`);
+                res({});
+                return;
+            }
+            console.warn('Failed to stat chat file:', pathToFile, error);
+            res({});
+            return;
+        }`;
+var ORIGINAL_STREAM_BLOCK = `        const fileStream = fs.createReadStream(pathToFile);
+        const rl = readline.createInterface({`;
+var PATCHED_STREAM_BLOCK = `        const fileStream = fs.createReadStream(pathToFile);
+        fileStream.on('error', (error) => {
+            if (error?.code === 'ENOENT') {
+                console.debug(\`Chat file disappeared while reading, skipping: \${pathToFile}\`);
+            } else {
+                console.warn('Failed to read chat file:', pathToFile, error);
+            }
+            res({});
+        });
+        const rl = readline.createInterface({`;
+function getChatsEndpointPath() {
+  return path11.join(getServerRoot(), "src", "endpoints", "chats.js");
+}
+function readChatsSource(filePath) {
+  if (!fs12.existsSync(filePath)) return { exists: false, text: "" };
+  return { exists: true, text: fs12.readFileSync(filePath, "utf8") };
+}
+function writeUtf8NoBom(filePath, text) {
+  fs12.writeFileSync(filePath, text, { encoding: "utf8" });
+}
+function replaceOnce(text, search, replacement, label) {
+  if (!text.includes(search)) throw new Error(`${label} pattern not found`);
+  return text.replace(search, replacement);
+}
+function removeStatPatch(text) {
+  if (text.includes(PATCHED_STAT_BLOCK)) {
+    return text.replace(PATCHED_STAT_BLOCK, ORIGINAL_STAT_LINE);
+  }
+  const statPatchRegex = /        let stats;\r?\n        try \{\r?\n            stats = await fs\.promises\.stat\(pathToFile\);[\s\S]*?\r?\n        \}\r?\n        const hasMatcher = \(typeof matcher === 'function'\);/;
+  if (!statPatchRegex.test(text)) return text;
+  return text.replace(statPatchRegex, `${ORIGINAL_STAT_LINE}
+        const hasMatcher = (typeof matcher === 'function');`);
+}
+function removeStreamPatch(text) {
+  if (text.includes(PATCHED_STREAM_BLOCK)) {
+    return text.replace(PATCHED_STREAM_BLOCK, ORIGINAL_STREAM_BLOCK);
+  }
+  const streamPatchRegex = /        const fileStream = fs\.createReadStream\(pathToFile\);\r?\n        fileStream\.on\('error', \(error\) => \{[\s\S]*?\r?\n        \}\);\r?\n        const rl = readline\.createInterface\(\{/;
+  if (!streamPatchRegex.test(text)) return text;
+  return text.replace(streamPatchRegex, ORIGINAL_STREAM_BLOCK);
+}
+function getChatsEnoentPatchStatus() {
+  const filePath = getChatsEndpointPath();
+  let text = "";
+  let exists = false;
+  try {
+    const source = readChatsSource(filePath);
+    exists = source.exists;
+    text = source.text;
+  } catch (error) {
+    return { ok: false, filePath, exists, installed: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  return {
+    ok: true,
+    name: "chats-enoent-guard",
+    version: VERSION,
+    filePath,
+    exists,
+    installed: !!text && text.includes(CHAT_INFO_ENOENT_SENTINEL),
+    streamGuardInstalled: !!text && text.includes(CHAT_STREAM_ENOENT_SENTINEL),
+    reversible: true,
+    backupRequired: false
+  };
+}
+function applyChatsEnoentPatch() {
+  const status = getChatsEnoentPatchStatus();
+  if (!status.ok) return { ...status, changed: false, action: "apply" };
+  if (!status.exists) return { ...status, ok: false, changed: false, action: "apply", error: "chats.js not found" };
+  const filePath = status.filePath;
+  let text = fs12.readFileSync(filePath, "utf8");
+  const original = text;
+  if (!text.includes(CHAT_INFO_ENOENT_SENTINEL)) {
+    text = replaceOnce(text, ORIGINAL_STAT_LINE, PATCHED_STAT_BLOCK, "stat");
+  }
+  if (!text.includes(CHAT_STREAM_ENOENT_SENTINEL)) {
+    text = replaceOnce(text, ORIGINAL_STREAM_BLOCK, PATCHED_STREAM_BLOCK, "stream");
+  }
+  if (text === original) {
+    return { ...getChatsEnoentPatchStatus(), changed: false, action: "apply", restartRequired: false };
+  }
+  writeUtf8NoBom(filePath, text);
+  return { ...getChatsEnoentPatchStatus(), changed: true, action: "apply", restartRequired: true };
+}
+function revertChatsEnoentPatch() {
+  const status = getChatsEnoentPatchStatus();
+  if (!status.ok) return { ...status, changed: false, action: "revert" };
+  if (!status.exists) return { ...status, ok: false, changed: false, action: "revert", error: "chats.js not found" };
+  const filePath = status.filePath;
+  let text = fs12.readFileSync(filePath, "utf8");
+  const original = text;
+  text = removeStatPatch(text);
+  text = removeStreamPatch(text);
+  if (text === original) {
+    return { ...getChatsEnoentPatchStatus(), changed: false, action: "revert", restartRequired: false };
+  }
+  writeUtf8NoBom(filePath, text);
+  return { ...getChatsEnoentPatchStatus(), changed: true, action: "revert", restartRequired: true };
+}
+function autoApplySourcePatches() {
+  const results = [];
+  try {
+    results.push(applyChatsEnoentPatch());
+  } catch (error) {
+    results.push({ ok: false, name: "chats-enoent-guard", action: "apply", error: error instanceof Error ? error.message : String(error) });
+  }
+  return results;
+}
+
 // server-plugins/cocktail-plus/src/routes.ts
 function sendJson3(res, data) {
   res.setHeader(HEADER_PREFIX, VERSION);
@@ -4816,6 +4949,9 @@ function registerRoutes(router) {
         serverRoot: getServerRoot(),
         dataRoot: getDataRoot(),
         pluginDir: PLUGIN_DIR
+      },
+      sourcePatches: {
+        chatsEnoentGuard: getChatsEnoentPatchStatus()
       },
       stats,
       status: getUserStatus(ctx),
@@ -4851,13 +4987,13 @@ function registerRoutes(router) {
       res.status(404).type("text/plain").send("Not found");
       return;
     }
-    const filePath = path11.join(PLUGIN_DIR, "scripts", fileName);
-    if (!fs12.existsSync(filePath)) {
+    const filePath = path12.join(PLUGIN_DIR, "scripts", fileName);
+    if (!fs13.existsSync(filePath)) {
       res.status(404).type("text/plain").send("Helper script not found");
       return;
     }
     res.setHeader("cache-control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-    res.type("text/plain; charset=utf-8").send(fs12.readFileSync(filePath, "utf8"));
+    res.type("text/plain; charset=utf-8").send(fs13.readFileSync(filePath, "utf8"));
   });
   router.get("/module", async (req, res) => handleModuleProxy(req, res));
   router.post("/early/status", async (_req, res) => {
@@ -4872,6 +5008,16 @@ function registerRoutes(router) {
     const noBackup = asBoolean(req.body?.noBackup, false);
     const result = uninstallEarlyBridge({ noBackup });
     sendJson3(res, result);
+  });
+  router.post("/source-patches/status", async (_req, res) => {
+    sendJson3(res, { ok: true, chatsEnoentGuard: getChatsEnoentPatchStatus() });
+  });
+  router.post("/source-patches/chats-enoent/apply", async (req, res) => {
+    const result = applyChatsEnoentPatch();
+    sendJson3(res, result);
+  });
+  router.post("/source-patches/chats-enoent/revert", async (_req, res) => {
+    sendJson3(res, revertChatsEnoentPatch());
   });
   registerFastRoutes(router);
   router.post(settingsGetEndpoint.fastPath, async (req, res) => handleSettingsGetFast(req, res));
@@ -4917,6 +5063,16 @@ function registerRoutes(router) {
 
 // server-plugins/cocktail-plus/src/index.ts
 async function init(router) {
+  if (config.autoPatchChatsEnoentGuard) {
+    const patchResults = autoApplySourcePatches();
+    for (const result of patchResults) {
+      if (result?.changed) {
+        console.warn("[cocktail-plus] ST source patch applied; restart SillyTavern to load it:", result);
+      } else {
+        console.log("[cocktail-plus] ST source patch status:", result);
+      }
+    }
+  }
   const earlyResult = autoEnsureEarlyBridge();
   if (earlyResult?.ok) {
     console.log("[cocktail-plus] early bridge status:", earlyResult.status || earlyResult);

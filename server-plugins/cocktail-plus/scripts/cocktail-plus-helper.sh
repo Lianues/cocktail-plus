@@ -565,6 +565,91 @@ remove_backend_plugin() {
   say_warn '请重启 SillyTavern 后生效。'
 }
 
+patch_sillytavern_chats_enoent() {
+  local action="$1"
+  ensure_config_selected || return 1
+  local chats_path="$SELECTED_ROOT/src/endpoints/chats.js"
+  if [ ! -f "$chats_path" ]; then say_warn "找不到 chats.js：$chats_path"; return 1; fi
+  if ! command -v node >/dev/null 2>&1; then say_warn '找不到 node，无法自动处理 chats.js。'; return 1; fi
+  node - "$SELECTED_ROOT" "$action" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const [root, action] = process.argv.slice(2);
+const file = path.join(root, 'src', 'endpoints', 'chats.js');
+if (!fs.existsSync(file)) throw new Error(`Missing file: ${file}`);
+const originalStat = '        const stats = await fs.promises.stat(pathToFile);';
+const patchedStat = `        let stats;
+        try {
+            stats = await fs.promises.stat(pathToFile);
+        } catch (error) {
+            if (error?.code === 'ENOENT') {
+                console.debug(\`Chat file no longer exists, skipping: \${pathToFile}\`);
+                res({});
+                return;
+            }
+            console.warn('Failed to stat chat file:', pathToFile, error);
+            res({});
+            return;
+        }`;
+const originalStream = `        const fileStream = fs.createReadStream(pathToFile);
+        const rl = readline.createInterface({`;
+const patchedStream = `        const fileStream = fs.createReadStream(pathToFile);
+        fileStream.on('error', (error) => {
+            if (error?.code === 'ENOENT') {
+                console.debug(\`Chat file disappeared while reading, skipping: \${pathToFile}\`);
+            } else {
+                console.warn('Failed to read chat file:', pathToFile, error);
+            }
+            res({});
+        });
+        const rl = readline.createInterface({`;
+let text = fs.readFileSync(file, 'utf8');
+const before = text;
+if (action === 'apply') {
+  if (!text.includes('Chat file no longer exists, skipping')) {
+    if (!text.includes(originalStat)) throw new Error('stat patch point not found');
+    text = text.replace(originalStat, patchedStat);
+  }
+  if (!text.includes('Chat file disappeared while reading')) {
+    if (!text.includes(originalStream)) throw new Error('stream patch point not found');
+    text = text.replace(originalStream, patchedStream);
+  }
+} else if (action === 'revert') {
+  text = text.replace(patchedStat, originalStat);
+  text = text.replace(/        const fileStream = fs\.createReadStream\(pathToFile\);\r?\n        fileStream\.on\('error', \(error\) => \{[\s\S]*?\r?\n        \}\);\r?\n        const rl = readline\.createInterface\(\{/, originalStream);
+} else {
+  throw new Error('unknown action: ' + action);
+}
+if (text === before) {
+  console.log(action === 'apply' ? '补丁已存在。' : '未发现补丁，无需恢复。');
+} else {
+  fs.writeFileSync(file, text, 'utf8');
+  console.log((action === 'apply' ? '已应用补丁：' : '已恢复补丁：') + file);
+}
+NODE
+  local rc=$?
+  [ "$rc" -eq 0 ] && say_warn '请重启 SillyTavern 后生效。'
+  return "$rc"
+}
+
+source_patch_menu() {
+  ensure_config_selected || return 1
+  say_title 'SillyTavern 聊天文件 ENOENT 崩溃补丁'
+  printf '[1] 应用补丁\n'
+  printf '[2] 恢复补丁\n'
+  printf '[0] 返回\n'
+  local choice
+  read -r -p '请选择: ' choice
+  case "$choice" in
+    1) patch_sillytavern_chats_enoent apply ;;
+    2) patch_sillytavern_chats_enoent revert ;;
+    0) return 0 ;;
+    *) say_warn '无效选项。' ;;
+  esac
+}
+
+
+
 backend_plugin_dir() {
   ensure_config_selected || return 1
   printf '%s\n' "$SELECTED_ROOT/plugins/$PLUGIN_ID"
@@ -637,6 +722,7 @@ const schema = [
   ['patchSystemMessagesInit', '替换 initSystemMessages 模板串行', 'bool', true],
   ['patchExtensionManifests', '替换 getManifests 使用预取结果', 'bool', true],
   ['patchParallelActivateExtensions', '并行激活扩展（实验）', 'bool', true],
+  ['autoPatchChatsEnoentGuard', '启动时自动写入 ST chats.js ENOENT 防崩补丁', 'bool', false],
 ];
 const defaults = Object.fromEntries(schema.map(([k, _label, _type, def]) => [k, def]));
 function readConfig() {
@@ -1145,6 +1231,7 @@ show_menu() {
   printf '[9] 重启 SillyTavern 酒馆本体\n'
   printf '[10] 更新 cocktail-plus 后端扩展版本\n'
   printf '[11] 显示当前选择\n'
+  printf '[12] 修复 SillyTavern 聊天文件 ENOENT 崩溃问题\n'
   printf '[0] 退出\n'
 }
 
@@ -1170,6 +1257,7 @@ while true; do
     9) restart_sillytavern ;;
     10) update_backend_from_repository ;;
     11) show_current_selection ;;
+    12) source_patch_menu ;;
     0) break ;;
     *) say_warn '无效选项。' ;;
   esac

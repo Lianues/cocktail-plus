@@ -60,6 +60,9 @@ export const DEFAULT_CONFIG = Object.freeze({
     patchSystemMessagesInit: true,
     patchExtensionManifests: true,
     patchParallelActivateExtensions: true,
+    // Optional ST source hotfix. When enabled, plugin patches src/endpoints/chats.js on startup;
+    // a restart is still required for the patched source to be loaded by SillyTavern.
+    autoPatchChatsEnoentGuard: false,
 });
 
 function asBool(value, fallback = false) {
@@ -123,6 +126,7 @@ export function normalizeConfig(input = {}) {
     out.patchSystemMessagesInit = asBool(input.patchSystemMessagesInit, DEFAULT_CONFIG.patchSystemMessagesInit);
     out.patchExtensionManifests = asBool(input.patchExtensionManifests, DEFAULT_CONFIG.patchExtensionManifests);
     out.patchParallelActivateExtensions = asBool(input.patchParallelActivateExtensions, DEFAULT_CONFIG.patchParallelActivateExtensions);
+    out.autoPatchChatsEnoentGuard = asBool(input.autoPatchChatsEnoentGuard, DEFAULT_CONFIG.autoPatchChatsEnoentGuard);
     return out;
 }
 

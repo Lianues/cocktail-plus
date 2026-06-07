@@ -15,6 +15,7 @@ import { getSettingsSaveStatus, handleSettingsSaveFast, settingsSaveEndpoint } f
 import { clearSettingsGetCache, getSettingsGetStatus, handleSettingsGetFast, settingsGetEndpoint } from './endpoints/settings-get.js';
 import { handleModuleProxy } from './module-proxy.js';
 import { getDataRoot, getServerRoot } from './utils.js';
+import { applyChatsEnoentPatch, getChatsEnoentPatchStatus, revertChatsEnoentPatch } from './source-patches.js';
 
 function sendJson(res, data) {
     res.setHeader(HEADER_PREFIX, VERSION);
@@ -44,6 +45,9 @@ export function registerRoutes(router) {
                 serverRoot: getServerRoot(),
                 dataRoot: getDataRoot(),
                 pluginDir: PLUGIN_DIR,
+            },
+            sourcePatches: {
+                chatsEnoentGuard: getChatsEnoentPatchStatus(),
             },
             stats,
             status: getUserStatus(ctx),
@@ -106,6 +110,19 @@ export function registerRoutes(router) {
         const noBackup = asBoolean(req.body?.noBackup, false);
         const result = uninstallEarlyBridge({ noBackup });
         sendJson(res, result);
+    });
+
+    router.post('/source-patches/status', async (_req, res) => {
+        sendJson(res, { ok: true, chatsEnoentGuard: getChatsEnoentPatchStatus() });
+    });
+
+    router.post('/source-patches/chats-enoent/apply', async (req, res) => {
+        const result = applyChatsEnoentPatch();
+        sendJson(res, result);
+    });
+
+    router.post('/source-patches/chats-enoent/revert', async (_req, res) => {
+        sendJson(res, revertChatsEnoentPatch());
     });
 
     registerFastRoutes(router);

@@ -396,6 +396,132 @@ function Repair-BackendUninstallBlackScreen {
 }
 
 
+
+function Get-ChatsEnoentPatchPath {
+    Ensure-ConfigSelected
+    $chatsPath = Join-Path $Script:SelectedRoot 'src\endpoints\chats.js'
+    if (-not (Test-Path -LiteralPath $chatsPath -PathType Leaf)) {
+        throw "找不到 chats.js：$chatsPath"
+    }
+    return $chatsPath
+}
+
+function Apply-SillyTavernChatsEnoentPatch {
+    $chatsPath = Get-ChatsEnoentPatchPath
+    $text = Get-Content -LiteralPath $chatsPath -Raw -Encoding UTF8
+    $original = $text
+
+    $oldStat = '        const stats = await fs.promises.stat(pathToFile);'
+    $newStat = @'
+        let stats;
+        try {
+            stats = await fs.promises.stat(pathToFile);
+        } catch (error) {
+            if (error?.code === 'ENOENT') {
+                console.debug(`Chat file no longer exists, skipping: ${pathToFile}`);
+                res({});
+                return;
+            }
+            console.warn('Failed to stat chat file:', pathToFile, error);
+            res({});
+            return;
+        }
+'@.TrimEnd()
+
+    if ($text -notlike '*Chat file no longer exists, skipping*') {
+        if (-not $text.Contains($oldStat)) { throw '未找到 stat 补丁插入点，可能当前版本源码结构不同。' }
+        $text = $text.Replace($oldStat, $newStat)
+    }
+
+    if ($text -notlike '*Chat file disappeared while reading*') {
+        $streamPattern = '        const fileStream = fs\.createReadStream\(pathToFile\);\r?\n        const rl = readline\.createInterface\(\{'
+        if (-not [regex]::IsMatch($text, $streamPattern)) { throw '未找到 read stream 补丁插入点，可能当前版本源码结构不同。' }
+        $newStream = @'
+        const fileStream = fs.createReadStream(pathToFile);
+        fileStream.on('error', (error) => {
+            if (error?.code === 'ENOENT') {
+                console.debug(`Chat file disappeared while reading, skipping: ${pathToFile}`);
+            } else {
+                console.warn('Failed to read chat file:', pathToFile, error);
+            }
+            res({});
+        });
+        const rl = readline.createInterface({
+'@.TrimEnd()
+        $text = [regex]::Replace($text, $streamPattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $newStream }, 1)
+    }
+
+    if ($text -eq $original) {
+        Write-Warn 'chats.js 看起来已经包含 ENOENT 防崩补丁。'
+        return
+    }
+
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($chatsPath, $text, $enc)
+    Write-Ok "已应用补丁：$chatsPath"
+    Write-Warn '请重启 SillyTavern 后生效。'
+}
+
+function Restore-SillyTavernChatsEnoentPatch {
+    $chatsPath = Get-ChatsEnoentPatchPath
+    $text = Get-Content -LiteralPath $chatsPath -Raw -Encoding UTF8
+    $original = $text
+
+    $oldStat = @'
+        let stats;
+        try {
+            stats = await fs.promises.stat(pathToFile);
+        } catch (error) {
+            if (error?.code === 'ENOENT') {
+                console.debug(`Chat file no longer exists, skipping: ${pathToFile}`);
+                res({});
+                return;
+            }
+            console.warn('Failed to stat chat file:', pathToFile, error);
+            res({});
+            return;
+        }
+'@.TrimEnd()
+    $newStat = '        const stats = await fs.promises.stat(pathToFile);'
+    if ($text.Contains($oldStat)) { $text = $text.Replace($oldStat, $newStat) }
+
+    $streamPattern = "        const fileStream = fs\.createReadStream\(pathToFile\);\r?\n        fileStream\.on\('error', \(error\) => \{[\s\S]*?\r?\n        \}\);\r?\n        const rl = readline\.createInterface\(\{"
+    $streamOriginal = @'
+        const fileStream = fs.createReadStream(pathToFile);
+        const rl = readline.createInterface({
+'@.TrimEnd()
+    if ([regex]::IsMatch($text, $streamPattern)) {
+        $text = [regex]::Replace($text, $streamPattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $streamOriginal }, 1)
+    }
+
+    if ($text -eq $original) {
+        Write-Warn 'chats.js 未发现 ENOENT 防崩补丁，无需恢复。'
+        return
+    }
+
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($chatsPath, $text, $enc)
+    Write-Ok "已恢复补丁：$chatsPath"
+    Write-Warn '请重启 SillyTavern 后生效。'
+}
+
+function Invoke-SillyTavernChatsEnoentPatchMenu {
+    Ensure-ConfigSelected
+    Write-Title 'SillyTavern 聊天文件 ENOENT 崩溃补丁'
+    Write-Host '[1] 应用补丁'
+    Write-Host '[2] 恢复补丁'
+    Write-Host '[0] 返回'
+    $choice = Read-Host '请选择'
+    switch ($choice.Trim()) {
+        '1' { Apply-SillyTavernChatsEnoentPatch }
+        '2' { Restore-SillyTavernChatsEnoentPatch }
+        '0' { return }
+        default { Write-Warn '无效选项。' }
+    }
+}
+
+
+
 function Remove-BackendPlugin {
     Ensure-ConfigSelected
     Write-Title '删除后端扩展'
@@ -462,7 +588,8 @@ function Get-BackendConfigSchema {
         [pscustomobject]@{ Key='patchI18nInit'; Label='替换 initLocales 串行等待'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='patchSystemMessagesInit'; Label='替换 initSystemMessages 模板串行'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='patchExtensionManifests'; Label='替换 getManifests 使用预取结果'; Type='bool'; Default=$true },
-        [pscustomobject]@{ Key='patchParallelActivateExtensions'; Label='并行激活扩展（实验）'; Type='bool'; Default=$true }
+        [pscustomobject]@{ Key='patchParallelActivateExtensions'; Label='并行激活扩展（实验）'; Type='bool'; Default=$true },
+        [pscustomobject]@{ Key='autoPatchChatsEnoentGuard'; Label='启动时自动写入 ST chats.js ENOENT 防崩补丁'; Type='bool'; Default=$false }
     )
 }
 
@@ -1011,6 +1138,7 @@ function Show-Menu {
     Write-Host '[9] 重启 SillyTavern 酒馆本体'
     Write-Host '[10] 更新 cocktail-plus 后端扩展版本'
     Write-Host '[11] 显示当前选择'
+    Write-Host '[12] 修复 SillyTavern 聊天文件 ENOENT 崩溃问题'
     Write-Host '[0] 退出'
 }
 
@@ -1037,6 +1165,7 @@ while ($true) {
             '9' { Invoke-RestartSillyTavern }
             '10' { Invoke-BackendUpdateFromRepository }
             '11' { Show-CurrentSelection }
+            '12' { Invoke-SillyTavernChatsEnoentPatchMenu }
             '0' { break }
             default { Write-Warn '无效选项。' }
         }
