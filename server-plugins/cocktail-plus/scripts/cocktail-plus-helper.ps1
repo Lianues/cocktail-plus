@@ -6,6 +6,10 @@ $ErrorActionPreference = 'Stop'
 $PluginId = 'cocktail-plus'
 $Script:SelectedConfigPath = $null
 $Script:SelectedRoot = $null
+$Script:BackendUpdateNotice = $null
+$Script:BackendUpdateCheckError = $null
+$Script:BackendUpdateCheckJob = $null
+$Script:BackendUpdateCheckStartedAt = $null
 
 function Write-Title([string]$Text) {
     Write-Host ''
@@ -54,6 +58,7 @@ function Set-SelectedConfig([string]$ConfigPath) {
     $Script:SelectedRoot = Split-Path -Parent $full
     Write-Ok "当前 SillyTavern: $Script:SelectedRoot"
     Write-Host "config.yaml: $Script:SelectedConfigPath"
+    try { Start-BackendUpdateCheck } catch {}
 }
 
 function Add-UniquePath([System.Collections.Generic.List[string]]$List, [string]$Path) {
@@ -622,24 +627,153 @@ function Compare-VersionString([string]$A, [string]$B) {
     try { return ([version]$A).CompareTo([version]$B) } catch { return [string]::Compare($A, $B, $true) }
 }
 
-function Get-RemoteCocktailPlusInfo {
+function Get-RemoteCocktailPlusInfo([switch]$Quiet) {
     $sources = @(
         [pscustomobject]@{ Name='GitHub'; Manifest='https://raw.githubusercontent.com/Lianues/cocktail-plus/main/manifest.json'; Repo='https://github.com/Lianues/cocktail-plus.git' },
         [pscustomobject]@{ Name='Gitee'; Manifest='https://gitee.com/lianues/cocktail-plus/raw/main/manifest.json'; Repo='https://gitee.com/lianues/cocktail-plus.git' }
     )
     foreach ($source in $sources) {
         try {
-            Write-Info "检查远端版本：$($source.Name)"
+            if (-not $Quiet) { Write-Info "检查远端版本：$($source.Name)" }
             $manifest = Invoke-RestMethod -Uri $source.Manifest -Method GET -TimeoutSec 8
             $version = [string]$manifest.version
             if (-not [string]::IsNullOrWhiteSpace($version)) {
                 return [pscustomobject]@{ Name=$source.Name; Version=$version.Trim(); Repo=$source.Repo; Sources=$sources }
             }
         } catch {
-            Write-Warn "$($source.Name) 检查失败：$($_.Exception.Message)"
+            if (-not $Quiet) { Write-Warn "$($source.Name) 检查失败：$($_.Exception.Message)" }
         }
     }
     throw '无法从 GitHub/Gitee 获取 cocktail-plus 远端版本。'
+}
+
+function Get-HelperBundledBackendDir {
+    if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { return $null }
+    try {
+        $dir = Split-Path -Parent $PSScriptRoot
+        if ((Test-Path -LiteralPath $dir -PathType Container) -and (Test-Path -LiteralPath (Join-Path $dir 'index.mjs') -PathType Leaf)) {
+            return $dir
+        }
+    } catch {}
+    return $null
+}
+
+function Get-BackendUpdateCurrentDir {
+    if ($Script:SelectedRoot) {
+        $installed = Join-Path (Join-Path $Script:SelectedRoot 'plugins') $PluginId
+        if (Test-Path -LiteralPath $installed -PathType Container) { return $installed }
+    }
+    try {
+        $processConfigs = @(Find-SillyTavernConfigsFromProcesses 6>$null | Where-Object { Test-SillyTavernConfig $_ } | Select-Object -Unique)
+        if ($processConfigs.Count -eq 1) {
+            $root = Split-Path -Parent $processConfigs[0]
+            $installed = Join-Path (Join-Path $root 'plugins') $PluginId
+            if (Test-Path -LiteralPath $installed -PathType Container) { return $installed }
+        }
+    } catch {
+        # 启动自动检查只做静默探测，失败时回退到脚本所在后端目录。
+    }
+    return (Get-HelperBundledBackendDir)
+}
+
+function Update-BackendUpdateNotice([switch]$Quiet) {
+    $Script:BackendUpdateNotice = $null
+    $Script:BackendUpdateCheckError = $null
+    try {
+        $currentDir = Get-BackendUpdateCurrentDir
+        $currentVersion = if ($currentDir) { Get-BackendVersion $currentDir } else { $null }
+        if ([string]::IsNullOrWhiteSpace($currentVersion)) { return }
+
+        $remote = Get-RemoteCocktailPlusInfo -Quiet:$Quiet
+        if ($remote -and $remote.Version -and (Compare-VersionString $currentVersion $remote.Version) -lt 0) {
+            $Script:BackendUpdateNotice = [pscustomobject]@{
+                CurrentVersion = $currentVersion
+                RemoteVersion = $remote.Version
+                SourceName = $remote.Name
+            }
+        }
+    } catch {
+        $Script:BackendUpdateCheckError = $_.Exception.Message
+        if (-not $Quiet) { Write-Warn "自动检查后端扩展更新失败：$Script:BackendUpdateCheckError" }
+    }
+}
+
+function Start-BackendUpdateCheck {
+    $Script:BackendUpdateNotice = $null
+    $Script:BackendUpdateCheckError = $null
+    try {
+        if ($Script:BackendUpdateCheckJob) {
+            Remove-Job -Job $Script:BackendUpdateCheckJob -Force -ErrorAction SilentlyContinue
+            $Script:BackendUpdateCheckJob = $null
+        }
+        $Script:BackendUpdateCheckStartedAt = $null
+    } catch {}
+
+    $currentDir = Get-BackendUpdateCurrentDir
+    $currentVersion = if ($currentDir) { Get-BackendVersion $currentDir } else { $null }
+    if ([string]::IsNullOrWhiteSpace($currentVersion)) { return }
+
+    try {
+        $Script:BackendUpdateCheckJob = Start-Job -ArgumentList $currentVersion -ScriptBlock {
+            param([string]$CurrentVersion)
+            function Compare-VersionString([string]$A, [string]$B) {
+                try { return ([version]$A).CompareTo([version]$B) } catch { return [string]::Compare($A, $B, $true) }
+            }
+
+            $sources = @(
+                [pscustomobject]@{ Name='GitHub'; Manifest='https://raw.githubusercontent.com/Lianues/cocktail-plus/main/manifest.json' },
+                [pscustomobject]@{ Name='Gitee'; Manifest='https://gitee.com/lianues/cocktail-plus/raw/main/manifest.json' }
+            )
+            foreach ($source in $sources) {
+                try {
+                    $manifest = Invoke-RestMethod -Uri $source.Manifest -Method GET -TimeoutSec 8
+                    $remoteVersion = [string]$manifest.version
+                    if (-not [string]::IsNullOrWhiteSpace($remoteVersion)) {
+                        $remoteVersion = $remoteVersion.Trim()
+                        if ((Compare-VersionString $CurrentVersion $remoteVersion) -lt 0) {
+                            return [pscustomobject]@{ CurrentVersion=$CurrentVersion; RemoteVersion=$remoteVersion; SourceName=$source.Name }
+                        }
+                        return $null
+                    }
+                } catch {}
+            }
+            return $null
+        }
+        $Script:BackendUpdateCheckStartedAt = [DateTime]::UtcNow
+    } catch {
+        # 如果后台任务不可用，则退回静默同步检查。
+        Update-BackendUpdateNotice -Quiet
+    }
+}
+
+function Receive-BackendUpdateCheckResult {
+    if (-not $Script:BackendUpdateCheckJob) { return }
+    if ($Script:BackendUpdateCheckJob.State -in @('Running', 'NotStarted')) {
+        if ($Script:BackendUpdateCheckStartedAt -and (([DateTime]::UtcNow - $Script:BackendUpdateCheckStartedAt).TotalSeconds -gt 30)) {
+            Remove-Job -Job $Script:BackendUpdateCheckJob -Force -ErrorAction SilentlyContinue
+            $Script:BackendUpdateCheckJob = $null
+            $Script:BackendUpdateCheckStartedAt = $null
+        }
+        return
+    }
+    try {
+        $result = Receive-Job -Job $Script:BackendUpdateCheckJob -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($result -and $result.RemoteVersion) { $Script:BackendUpdateNotice = $result }
+    } catch {
+        $Script:BackendUpdateCheckError = $_.Exception.Message
+    } finally {
+        Remove-Job -Job $Script:BackendUpdateCheckJob -Force -ErrorAction SilentlyContinue
+        $Script:BackendUpdateCheckJob = $null
+        $Script:BackendUpdateCheckStartedAt = $null
+    }
+}
+
+function Show-BackendUpdateNotice {
+    Receive-BackendUpdateCheckResult
+    if (-not $Script:BackendUpdateNotice) { return }
+    Write-Host ''
+    Write-Warn "检测到 cocktail-plus 后端扩展更新：$($Script:BackendUpdateNotice.CurrentVersion) -> $($Script:BackendUpdateNotice.RemoteVersion)（$($Script:BackendUpdateNotice.SourceName)）"
+    Write-Warn '输入9更新 cocktail-plus 后端扩展；前端扩展请在酒馆网页进行更新。'
 }
 
 function Clone-CocktailPlusRepo($RemoteInfo, [string]$TempRoot) {
@@ -679,6 +813,10 @@ function Copy-DirectoryContents([string]$Source, [string]$Destination) {
 function Invoke-BackendUpdateFromRepository {
     Ensure-ConfigSelected
     Write-Title '检查/更新 cocktail-plus 后端扩展'
+    if ($Script:BackendUpdateCheckJob) {
+        Remove-Job -Job $Script:BackendUpdateCheckJob -Force -ErrorAction SilentlyContinue
+        $Script:BackendUpdateCheckJob = $null
+    }
     $target = Get-BackendPluginDir
     $pluginsDir = Join-Path $Script:SelectedRoot 'plugins'
     New-Item -ItemType Directory -Force -Path $pluginsDir | Out-Null
@@ -733,6 +871,7 @@ function Invoke-BackendUpdateFromRepository {
 
     Set-ConfigBool $Script:SelectedConfigPath 'enableServerPlugins' $true
     Write-Ok "后端扩展已更新到：$target"
+    $Script:BackendUpdateNotice = $null
     Write-Warn '请重启 SillyTavern 后生效。'
 }
 
@@ -833,6 +972,7 @@ function Show-Menu {
     Write-Host ''
     Write-Host '后端扩展和前端扩展更新是独立的，需要分别进行更新'
     Write-Host '后端扩展更新输入9，前端扩展更新在酒馆网页进行更新'
+    Show-BackendUpdateNotice
     Write-Host ''
     Write-Host '[1] 自动探测 SillyTavern/config.yaml（酒馆配置文件）'
     Write-Host '[2] 手动输入 SillyTavern/config.yaml（酒馆配置文件）路径'
@@ -846,6 +986,8 @@ function Show-Menu {
     Write-Host '[10] 显示当前选择'
     Write-Host '[0] 退出'
 }
+
+Start-BackendUpdateCheck
 
 while ($true) {
     try {

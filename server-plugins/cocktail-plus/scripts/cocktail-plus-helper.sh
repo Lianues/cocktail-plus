@@ -6,6 +6,12 @@ set -u
 PLUGIN_ID="cocktail-plus"
 SELECTED_CONFIG=""
 SELECTED_ROOT=""
+BACKEND_UPDATE_NOTICE_CURRENT=""
+BACKEND_UPDATE_NOTICE_REMOTE=""
+BACKEND_UPDATE_NOTICE_SOURCE=""
+BACKEND_UPDATE_CHECK_PID=""
+BACKEND_UPDATE_NOTICE_FILE=""
+BACKEND_UPDATE_CHECK_STARTED_AT=""
 
 say_title() {
   printf '\n\033[35m%s\033[0m\n' "$1"
@@ -60,6 +66,7 @@ set_selected_config() {
   SELECTED_ROOT="$(dirname "$cfg")"
   say_ok "当前 SillyTavern: $SELECTED_ROOT"
   printf 'config.yaml: %s\n' "$SELECTED_CONFIG"
+  start_backend_update_check >/dev/null 2>&1 || true
 }
 
 find_configs_from_processes() {
@@ -582,6 +589,8 @@ find_sillytavern_pids_for_root() {
     done < <(ps -eo pid=,args= 2>/dev/null || true)
     list_port_pids "$port"
   } | awk -v self="$$" 'NF && $0 != self && !seen[$0]++'
+}
+
 read_backend_version() {
   local dir="$1" file text
   if [ -f "$dir/version.json" ]; then
@@ -635,6 +644,123 @@ console.log(out);
 NODE
 }
 
+helper_bundled_backend_dir() {
+  local script_dir backend_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P || true)"
+  [ -n "$script_dir" ] || return 1
+  backend_dir="$(dirname "$script_dir")"
+  if [ -d "$backend_dir" ] && [ -f "$backend_dir/index.mjs" ]; then
+    printf '%s\n' "$backend_dir"
+    return 0
+  fi
+  return 1
+}
+
+backend_update_current_dir() {
+  if [ -n "$SELECTED_ROOT" ] && [ -d "$SELECTED_ROOT/plugins/$PLUGIN_ID" ]; then
+    printf '%s\n' "$SELECTED_ROOT/plugins/$PLUGIN_ID"
+    return 0
+  fi
+
+  local configs=() cfg root installed
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] && configs+=("$cfg")
+  done < <(find_configs_from_processes | unique_lines)
+  if [ "${#configs[@]}" -eq 1 ]; then
+    root="$(dirname "${configs[0]}")"
+    installed="$root/plugins/$PLUGIN_ID"
+    if [ -d "$installed" ]; then
+      printf '%s\n' "$installed"
+      return 0
+    fi
+  fi
+
+  helper_bundled_backend_dir
+}
+
+fetch_manifest_json() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 8 "$url" 2>/dev/null && return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=8 "$url" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+extract_manifest_version() {
+  sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -n 1
+}
+
+start_backend_update_check() {
+  BACKEND_UPDATE_NOTICE_CURRENT=""
+  BACKEND_UPDATE_NOTICE_REMOTE=""
+  BACKEND_UPDATE_NOTICE_SOURCE=""
+  if [ -n "$BACKEND_UPDATE_CHECK_PID" ] && kill -0 "$BACKEND_UPDATE_CHECK_PID" 2>/dev/null; then
+    kill "$BACKEND_UPDATE_CHECK_PID" 2>/dev/null || true
+  fi
+  BACKEND_UPDATE_CHECK_PID=""
+  BACKEND_UPDATE_CHECK_STARTED_AT=""
+
+  local current_dir current_version
+  current_dir="$(backend_update_current_dir 2>/dev/null || true)"
+  [ -n "$current_dir" ] || return 0
+  current_version="$(read_backend_version "$current_dir" 2>/dev/null || true)"
+  [ -n "$current_version" ] || return 0
+
+  BACKEND_UPDATE_NOTICE_FILE="${TMPDIR:-/tmp}/cocktail-plus-update-check-$$.txt"
+  rm -f "$BACKEND_UPDATE_NOTICE_FILE"
+  (
+    local name url manifest remote_version cmp
+    while IFS='|' read -r name url; do
+      [ -n "$name" ] || continue
+      manifest="$(fetch_manifest_json "$url" || true)"
+      remote_version="$(printf '%s' "$manifest" | extract_manifest_version)"
+      [ -n "$remote_version" ] || continue
+      cmp="$(compare_versions "$current_version" "$remote_version" 2>/dev/null || printf '0')"
+      if [ "$cmp" -lt 0 ] 2>/dev/null; then
+        printf '%s\t%s\t%s\n' "$current_version" "$remote_version" "$name" > "$BACKEND_UPDATE_NOTICE_FILE"
+      fi
+      exit 0
+    done <<'EOF'
+GitHub|https://raw.githubusercontent.com/Lianues/cocktail-plus/main/manifest.json
+Gitee|https://gitee.com/lianues/cocktail-plus/raw/main/manifest.json
+EOF
+  ) >/dev/null 2>&1 &
+  BACKEND_UPDATE_CHECK_PID="$!"
+  BACKEND_UPDATE_CHECK_STARTED_AT="$(date +%s)"
+}
+
+receive_backend_update_check() {
+  [ -n "$BACKEND_UPDATE_CHECK_PID" ] || return 0
+  if kill -0 "$BACKEND_UPDATE_CHECK_PID" 2>/dev/null; then
+    local now
+    now="$(date +%s)"
+    if [ -n "$BACKEND_UPDATE_CHECK_STARTED_AT" ] && [ $((now - BACKEND_UPDATE_CHECK_STARTED_AT)) -gt 30 ] 2>/dev/null; then
+      kill "$BACKEND_UPDATE_CHECK_PID" 2>/dev/null || true
+      BACKEND_UPDATE_CHECK_PID=""
+      BACKEND_UPDATE_CHECK_STARTED_AT=""
+    fi
+    return 0
+  fi
+  wait "$BACKEND_UPDATE_CHECK_PID" 2>/dev/null || true
+  BACKEND_UPDATE_CHECK_PID=""
+  BACKEND_UPDATE_CHECK_STARTED_AT=""
+  if [ -n "$BACKEND_UPDATE_NOTICE_FILE" ] && [ -f "$BACKEND_UPDATE_NOTICE_FILE" ]; then
+    IFS=$'\t' read -r BACKEND_UPDATE_NOTICE_CURRENT BACKEND_UPDATE_NOTICE_REMOTE BACKEND_UPDATE_NOTICE_SOURCE < "$BACKEND_UPDATE_NOTICE_FILE" || true
+    rm -f "$BACKEND_UPDATE_NOTICE_FILE"
+  fi
+}
+
+show_backend_update_notice() {
+  receive_backend_update_check
+  [ -n "$BACKEND_UPDATE_NOTICE_REMOTE" ] || return 0
+  printf '\n'
+  say_warn "检测到 cocktail-plus 后端扩展更新：$BACKEND_UPDATE_NOTICE_CURRENT -> $BACKEND_UPDATE_NOTICE_REMOTE（$BACKEND_UPDATE_NOTICE_SOURCE）"
+  say_warn '输入9更新 cocktail-plus 后端扩展；前端扩展请在酒馆网页进行更新。'
+}
+
 clone_cocktail_plus_repo() {
   local tmp="$1"
   if ! command -v git >/dev/null 2>&1; then
@@ -671,6 +797,11 @@ copy_dir_contents() {
 update_backend_from_repository() {
   ensure_config_selected || return 1
   say_title '检查/更新 cocktail-plus 后端扩展'
+  if [ -n "$BACKEND_UPDATE_CHECK_PID" ] && kill -0 "$BACKEND_UPDATE_CHECK_PID" 2>/dev/null; then
+    kill "$BACKEND_UPDATE_CHECK_PID" 2>/dev/null || true
+  fi
+  BACKEND_UPDATE_CHECK_PID=""
+  BACKEND_UPDATE_CHECK_STARTED_AT=""
   local target plugins_dir current tmp source remote_version cmp confirm backup_root backup item
   target="$SELECTED_ROOT/plugins/$PLUGIN_ID"
   plugins_dir="$SELECTED_ROOT/plugins"
@@ -722,10 +853,10 @@ NODE
   rm -rf "$tmp"
   set_config_bool "$SELECTED_CONFIG" enableServerPlugins true
   say_ok "后端扩展已更新到：$target"
+  BACKEND_UPDATE_NOTICE_CURRENT=""
+  BACKEND_UPDATE_NOTICE_REMOTE=""
+  BACKEND_UPDATE_NOTICE_SOURCE=""
   say_warn '请重启 SillyTavern 后生效。'
-}
-
-
 }
 
 restart_sillytavern() {
@@ -811,6 +942,7 @@ show_menu() {
   printf '\n'
   printf '后端扩展和前端扩展更新是独立的，需要分别进行更新\n'
   printf '后端扩展更新输入9，前端扩展更新在酒馆网页进行更新\n'
+  show_backend_update_notice
   printf '\n'
   printf '[1] 自动探测 SillyTavern/config.yaml（酒馆配置文件）\n'
   printf '[2] 手动输入 SillyTavern/config.yaml（酒馆配置文件）路径\n'
@@ -824,6 +956,8 @@ show_menu() {
   printf '[10] 显示当前选择\n'
   printf '[0] 退出\n'
 }
+
+start_backend_update_check >/dev/null 2>&1 || true
 
 while true; do
   show_menu
