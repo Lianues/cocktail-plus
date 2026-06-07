@@ -22,7 +22,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.4";
+  return "0.1.5";
 }
 var VERSION = readVersion();
 var info = {

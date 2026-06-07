@@ -303,7 +303,7 @@ const REPO_URLS = Object.freeze([
 ]);
 const REMOTE_MANIFEST_URLS = Object.freeze([
   "https://raw.githubusercontent.com/Lianues/cocktail-plus/main/manifest.json",
-  "https://gitee.com/lianues/cocktail-plus/raw/main/manifest.json"
+  "https://raw.giteeusercontent.com/lianues/cocktail-plus/raw/main/manifest.json"
 ]);
 function normalizeVersionString(version) {
   return String(version ?? "").trim();
@@ -583,7 +583,7 @@ function quotePowerShellSingle(value) {
 }
 const HELPER_SCRIPT_REMOTE_BASE_URLS = [
   "https://raw.githubusercontent.com/Lianues/cocktail-plus/main",
-  "https://gitee.com/lianues/cocktail-plus/raw/main"
+  "https://raw.giteeusercontent.com/lianues/cocktail-plus/raw/main"
 ];
 function getHelperScriptUrls(fileName) {
   return HELPER_SCRIPT_REMOTE_BASE_URLS.map((baseUrl) => `${baseUrl}/server-plugins/cocktail-plus/scripts/${fileName}`);

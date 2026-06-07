@@ -9,7 +9,7 @@ const REPO_URLS = Object.freeze([
 ]);
 const REMOTE_MANIFEST_URLS = Object.freeze([
   'https://raw.githubusercontent.com/Lianues/cocktail-plus/main/manifest.json',
-  'https://gitee.com/lianues/cocktail-plus/raw/main/manifest.json',
+  'https://raw.giteeusercontent.com/lianues/cocktail-plus/raw/main/manifest.json',
 ]);
 
 function normalizeVersionString(version: unknown) {

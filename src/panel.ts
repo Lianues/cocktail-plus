@@ -55,7 +55,7 @@ function quotePowerShellSingle(value: string) {
 
 const HELPER_SCRIPT_REMOTE_BASE_URLS = [
   'https://raw.githubusercontent.com/Lianues/cocktail-plus/main',
-  'https://gitee.com/lianues/cocktail-plus/raw/main',
+  'https://raw.giteeusercontent.com/lianues/cocktail-plus/raw/main',
 ];
 
 function getHelperScriptUrls(fileName: string) {

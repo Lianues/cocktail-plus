@@ -739,7 +739,7 @@ start_backend_update_check() {
       exit 0
     done <<'EOF'
 GitHub|https://raw.githubusercontent.com/Lianues/cocktail-plus/main/server-plugins/cocktail-plus/version.json
-Gitee|https://gitee.com/lianues/cocktail-plus/raw/main/server-plugins/cocktail-plus/version.json
+Gitee|https://raw.giteeusercontent.com/lianues/cocktail-plus/raw/main/server-plugins/cocktail-plus/version.json
 EOF
   ) >/dev/null 2>&1 &
   BACKEND_UPDATE_CHECK_PID="$!"

@@ -630,7 +630,7 @@ function Compare-VersionString([string]$A, [string]$B) {
 function Get-RemoteCocktailPlusInfo([switch]$Quiet) {
     $sources = @(
         [pscustomobject]@{ Name='GitHub'; Manifest='https://raw.githubusercontent.com/Lianues/cocktail-plus/main/server-plugins/cocktail-plus/version.json'; Repo='https://github.com/Lianues/cocktail-plus.git' },
-        [pscustomobject]@{ Name='Gitee'; Manifest='https://gitee.com/lianues/cocktail-plus/raw/main/server-plugins/cocktail-plus/version.json'; Repo='https://gitee.com/lianues/cocktail-plus.git' }
+        [pscustomobject]@{ Name='Gitee'; Manifest='https://raw.giteeusercontent.com/lianues/cocktail-plus/raw/main/server-plugins/cocktail-plus/version.json'; Repo='https://gitee.com/lianues/cocktail-plus.git' }
     )
     foreach ($source in $sources) {
         try {
@@ -722,7 +722,7 @@ function Start-BackendUpdateCheck {
 
             $sources = @(
                 [pscustomobject]@{ Name='GitHub'; Manifest='https://raw.githubusercontent.com/Lianues/cocktail-plus/main/server-plugins/cocktail-plus/version.json' },
-                [pscustomobject]@{ Name='Gitee'; Manifest='https://gitee.com/lianues/cocktail-plus/raw/main/server-plugins/cocktail-plus/version.json' }
+                [pscustomobject]@{ Name='Gitee'; Manifest='https://raw.giteeusercontent.com/lianues/cocktail-plus/raw/main/server-plugins/cocktail-plus/version.json' }
             )
             foreach ($source in $sources) {
                 try {
