@@ -1,18 +1,18 @@
 // @ts-nocheck
 import fs from 'node:fs';
 import path from 'node:path';
-import { API_PREFIX, HEADER_PREFIX, PLUGIN_DIR, SERVER_ROOT, VERSION } from './constants.js';
+import { API_PREFIX, HEADER_PREFIX, PLUGIN_DIR, VERSION } from './constants.js';
 import { config } from './config.js';
 import { ENDPOINT_LIST } from './endpoint-registry.js';
 import { CHAT_SAVE_HASH_ALGORITHM, chatSaveEndpoint, groupChatSaveEndpoint } from './endpoints/chat-save.js';
 import { settingsGetEndpoint } from './endpoints/settings-get.js';
 import { SETTINGS_HASH_ALGORITHM, settingsSaveEndpoint } from './endpoints/settings-save.js';
+import { getServerRoot } from './utils.js';
 
 const MARKER_START = '<!-- cocktail-plus early bridge start -->';
 const MARKER_END = '<!-- cocktail-plus early bridge end -->';
 const BRIDGE_SCRIPT_ID = 'cocktail-plus-early-bridge';
 const BRIDGE_SRC = `${API_PREFIX}/early/bridge.js`;
-const INDEX_PATH = path.join(SERVER_ROOT, 'public', 'index.html');
 const BACKUP_DIR = path.join(PLUGIN_DIR, 'backups');
 const MODULE_IMPORT_MAP_ID = 'cocktail-plus-module-import-map';
 // Only parser/static entry modules are rewritten as <script src="...">. The rest of the module graph should stay
@@ -20,6 +20,10 @@ const MODULE_IMPORT_MAP_ID = 'cocktail-plus-module-import-map';
 const MODULE_PROXY_ENTRY_PATHS = ['/scripts/i18n.js', '/script.js'];
 const MODULE_PROXY_IMPORT_PATHS = ['/script.js', '/scripts/i18n.js', '/scripts/system-messages.js', '/scripts/extensions.js', '/scripts/welcome-screen.js'];
 const MODULE_SCRIPT_PROXY_EXCLUDED_PREFIXES = ['/scripts/extensions/third-party/'];
+
+function getIndexPath() {
+    return path.join(getServerRoot(), 'public', 'index.html');
+}
 
 function normalizePublicModulePath(value) {
     let out = String(value || '').replace(/\\/g, '/');
@@ -88,8 +92,9 @@ function replaceScriptSrcAttribute(tag, nextSrc) {
 }
 
 function readIndexHtml() {
-    if (!fs.existsSync(INDEX_PATH)) return '';
-    return fs.readFileSync(INDEX_PATH, 'utf8');
+    const indexPath = getIndexPath();
+    if (!fs.existsSync(indexPath)) return '';
+    return fs.readFileSync(indexPath, 'utf8');
 }
 
 function countOccurrences(text, needle) {
@@ -159,6 +164,7 @@ function insertBridgeBlock(html) {
 }
 
 export function getEarlyBridgeStatus() {
+    const indexPath = getIndexPath();
     const html = readIndexHtml();
     const markerStartCount = countOccurrences(html, MARKER_START);
     const markerEndCount = countOccurrences(html, MARKER_END);
@@ -171,7 +177,7 @@ export function getEarlyBridgeStatus() {
         autoInstall: !!config.autoInstallEarlyBridge,
         installed,
         upToDate,
-        indexPath: INDEX_PATH,
+        indexPath,
         bridgeSrc: BRIDGE_SRC,
         markerStartCount,
         markerEndCount,
@@ -181,8 +187,9 @@ export function getEarlyBridgeStatus() {
 }
 
 export function installEarlyBridge(options = {}) {
+    const indexPath = getIndexPath();
     const html = readIndexHtml();
-    if (!html) return { ok: false, error: `index.html not found: ${INDEX_PATH}`, status: getEarlyBridgeStatus() };
+    if (!html) return { ok: false, error: `index.html not found: ${indexPath}`, status: getEarlyBridgeStatus() };
 
     const beforeStatus = getEarlyBridgeStatus();
     const { html: nextHtml, mode } = insertBridgeBlock(html);
@@ -193,13 +200,14 @@ export function installEarlyBridge(options = {}) {
 
     let backup = null;
     if (!options.noBackup) backup = makeBackup(html);
-    fs.writeFileSync(INDEX_PATH, finalHtml, 'utf8');
+    fs.writeFileSync(indexPath, finalHtml, 'utf8');
     return { ok: true, changed: true, mode, backup, status: getEarlyBridgeStatus() };
 }
 
 export function uninstallEarlyBridge(options = {}) {
+    const indexPath = getIndexPath();
     const html = readIndexHtml();
-    if (!html) return { ok: false, error: `index.html not found: ${INDEX_PATH}`, status: getEarlyBridgeStatus() };
+    if (!html) return { ok: false, error: `index.html not found: ${indexPath}`, status: getEarlyBridgeStatus() };
 
     const markerRegex = getMarkerRegex();
     markerRegex.lastIndex = 0;
@@ -211,7 +219,7 @@ export function uninstallEarlyBridge(options = {}) {
     const nextHtml = restoreIndexModuleProxyTags(html.replace(markerRegex, '').replace(/\n{3,}/g, '\n\n'));
     let backup = null;
     if (!options.noBackup) backup = makeBackup(html);
-    fs.writeFileSync(INDEX_PATH, nextHtml, 'utf8');
+    fs.writeFileSync(indexPath, nextHtml, 'utf8');
     return { ok: true, changed: true, backup, status: getEarlyBridgeStatus() };
 }
 
@@ -224,7 +232,7 @@ function makeFastRoutesLiteral() {
 function makeTemplatePreloadList() {
     const fallback = ['help.html', 'hotkeys.html', 'formatting.html', 'welcome.html', 'welcomePrompt.html', 'assistantNote.html'];
     try {
-        const dir = path.join(SERVER_ROOT, 'public', 'scripts', 'templates');
+        const dir = path.join(getServerRoot(), 'public', 'scripts', 'templates');
         const names = fs.readdirSync(dir)
             .filter(name => name.endsWith('.html'))
             .sort((a, b) => a.localeCompare(b));
@@ -652,6 +660,14 @@ ${fastRoutes}
 
   function getMethod(input, init) {
     return String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+  }
+
+  function getCacheMode(input, init) {
+    try {
+      if (init && init.cache) return String(init.cache);
+      if (input instanceof Request && input.cache) return String(input.cache);
+    } catch (_) {}
+    return '';
   }
 
   function cloneHeaders(input, init) {
@@ -1559,8 +1575,13 @@ ${fastRoutes}
         if (extensionResponse) return extensionResponse;
       }
       if (url && url.origin === location.origin && url.pathname.startsWith('/scripts/extensions/') && url.pathname.endsWith('/manifest.json') && method === 'GET') {
-        var manifestResponse = await consumePrefetchRecord(extensionManifestPrefetches.get(url.pathname)?.promise, 'extensions.manifest', Date.now());
-        if (manifestResponse) return manifestResponse;
+        var cacheMode = getCacheMode(input, init);
+        if (cacheMode === 'no-store' || cacheMode === 'reload' || cacheMode === 'no-cache') {
+          remember('extensions.manifest.prefetch-bypass', { path: url.pathname, cache: cacheMode });
+        } else {
+          var manifestResponse = await consumePrefetchRecord(extensionManifestPrefetches.get(url.pathname)?.promise, 'extensions.manifest', Date.now());
+          if (manifestResponse) return manifestResponse;
+        }
       }
       if (url && url.origin === location.origin && url.pathname === '/api/backgrounds/all' && method === 'POST') {
         var backgroundsResponse = await consumePrefetchRecord(backgroundsAllPrefetch, 'backgrounds.all', Date.now());

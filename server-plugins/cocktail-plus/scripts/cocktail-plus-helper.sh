@@ -12,6 +12,8 @@ BACKEND_UPDATE_NOTICE_SOURCE=""
 BACKEND_UPDATE_CHECK_PID=""
 BACKEND_UPDATE_NOTICE_FILE=""
 BACKEND_UPDATE_CHECK_STARTED_AT=""
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd || true)"
 
 say_title() {
   printf '\n\033[35m%s\033[0m\n' "$1"
@@ -58,6 +60,7 @@ set_selected_config() {
   local cfg
   cfg="$(abs_path "$1")"
   if [ -d "$cfg" ]; then cfg="$cfg/config.yaml"; fi
+  cfg="$(prefer_runtime_config_alias "$cfg")"
   if ! test_sillytavern_config "$cfg"; then
     say_warn "不是有效的 SillyTavern config.yaml: $1"
     return 1
@@ -66,6 +69,7 @@ set_selected_config() {
   SELECTED_ROOT="$(dirname "$cfg")"
   say_ok "当前 SillyTavern: $SELECTED_ROOT"
   printf 'config.yaml: %s\n' "$SELECTED_CONFIG"
+  warn_termux_environment_aliases "$SELECTED_ROOT"
   start_backend_update_check >/dev/null 2>&1 || true
 }
 
@@ -108,6 +112,115 @@ parent_dirs() {
   printf '/\n'
 }
 
+termux_path_aliases() {
+  local p="$1" suffix base
+  p="$(abs_path "$p")"
+  {
+    printf '%s\n' "$p"
+
+    case "$p" in
+      /data/data/com.termux/files/home/*)
+        suffix="${p#/data/data/com.termux/files/home/}"
+        [ -n "$suffix" ] && printf '/root/%s\n' "$suffix"
+        ;;
+      /root/*)
+        suffix="${p#/root/}"
+        [ -n "$suffix" ] && printf '/data/data/com.termux/files/home/%s\n' "$suffix"
+        ;;
+    esac
+
+    base="$(basename "$p")"
+    if [ -n "$base" ] && [ "$base" != "/" ]; then
+      [ -n "${HOME:-}" ] && printf '%s/%s\n' "$HOME" "$base"
+      printf '/root/%s\n' "$base"
+      printf '/data/data/com.termux/files/home/%s\n' "$base"
+    fi
+  } | unique_lines
+}
+
+config_aliases() {
+  local cfg="$1" root alias
+  [ -n "$cfg" ] || return 0
+  root="$(dirname "$cfg")"
+  while IFS= read -r alias; do
+    [ -n "$alias" ] || continue
+    test_sillytavern_root "$alias" || continue
+    printf '%s/config.yaml\n' "$alias"
+  done < <(termux_path_aliases "$root") | unique_lines
+}
+
+prefer_runtime_config_alias() {
+  local cfg="$1" root alias cwd
+  [ -f "$cfg" ] || { printf '%s\n' "$cfg"; return; }
+  root="$(dirname "$cfg")"
+  cwd="$(abs_path "$(pwd)")"
+
+  # Termux/proot can expose the same project under both
+  # /data/data/com.termux/files/home/SillyTavern and /root/SillyTavern.
+  # If the user is currently inside a valid alias root, prefer that runtime path
+  # so installs land in the running SillyTavern directory.
+  while IFS= read -r alias; do
+    [ -n "$alias" ] || continue
+    [ "$alias" = "$root" ] && continue
+    test_sillytavern_root "$alias" || continue
+    case "$cwd" in
+      "$alias"|"$alias"/*) printf '%s/config.yaml\n' "$alias"; return ;;
+    esac
+  done < <(termux_path_aliases "$root")
+
+  printf '%s\n' "$cfg"
+}
+
+path_identity() {
+  local p="$1"
+  [ -e "$p" ] || return 1
+  if stat -c '%d:%i' "$p" >/dev/null 2>&1; then
+    stat -c '%d:%i' "$p" 2>/dev/null
+  else
+    stat -f '%d:%i' "$p" 2>/dev/null
+  fi
+}
+
+same_directory() {
+  local a="$1" b="$2" ia ib
+  [ -d "$a" ] && [ -d "$b" ] || return 1
+  ia="$(path_identity "$a" 2>/dev/null || true)"
+  ib="$(path_identity "$b" 2>/dev/null || true)"
+  [ -n "$ia" ] && [ -n "$ib" ] && [ "$ia" = "$ib" ]
+}
+
+warn_termux_environment_aliases() {
+  local root="$1" alias distinct=0 same=0
+  [ -n "$root" ] || return 0
+  root="$(abs_path "$root")"
+
+  while IFS= read -r alias; do
+    [ -n "$alias" ] || continue
+    [ "$alias" = "$root" ] && continue
+    test_sillytavern_root "$alias" || continue
+
+    if same_directory "$root" "$alias"; then
+      same=1
+      say_info "检测到 Termux/proot 路径别名指向同一目录：$alias"
+    else
+      distinct=1
+      say_warn "检测到另一套可能独立的 SillyTavern 环境：$alias"
+    fi
+  done < <(termux_path_aliases "$root")
+
+  if [ "$distinct" -eq 1 ]; then
+    say_warn "本脚本只会安装/更新当前选择的环境：$root/plugins/$PLUGIN_ID"
+    say_warn '不会同时写入另一套 /root 与 /data/data/com.termux/... 环境，避免重复安装。'
+    say_warn '如果酒馆实际运行在另一套环境，请在那套 shell 中运行本脚本，或用菜单 [2] 手动选择它的 config.yaml。'
+  elif [ "$same" -eq 1 ]; then
+    say_info "当前选择的路径别名属于同一目录；不会产生双环境重复安装。"
+  fi
+}
+
+candidate_sillytavern_roots() {
+  { termux_path_aliases "$1"; parent_dirs "$(pwd)"; [ -n "${HOME:-}" ] && printf '%s/SillyTavern\n' "$HOME"; printf '/root/SillyTavern\n'; printf '/data/data/com.termux/files/home/SillyTavern\n'; } | unique_lines
+}
+
 search_configs_under() {
   local base="$1"
   local max_depth="${2:-5}"
@@ -128,7 +241,10 @@ find_configs_by_scan() {
     local bases=()
     bases+=("$(pwd)")
     [ -n "${HOME:-}" ] && bases+=("$HOME/Desktop" "$HOME/Downloads" "$HOME/Documents" "$HOME")
-    bases+=("/opt" "/srv" "/home" "/Users")
+    bases+=("/root" "/opt" "/srv" "/home" "/Users")
+    # Termux native and proot-distro commonly expose different absolute roots.
+    bases+=("/data/data/com.termux/files/home" "/data/data/com.termux/files/usr")
+    bases+=("/sdcard" "/storage/emulated/0")
 
     for base in "${bases[@]}"; do
       [ -d "$base" ] || continue
@@ -139,10 +255,20 @@ find_configs_by_scan() {
 }
 
 select_config_from_list() {
-  local configs=()
+  local raw_configs=() configs=()
+  while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
+    raw_configs+=("$cfg")
+  done
+
+  # Expand Termux/proot aliases before asking. If the running process reports
+  # /data/data/.../SillyTavern but /root/SillyTavern also exists, show both
+  # instead of presenting a misleading single Y/n choice.
   while IFS= read -r cfg; do
     [ -n "$cfg" ] && configs+=("$cfg")
-  done
+  done < <(
+    for cfg in "${raw_configs[@]}"; do config_aliases "$cfg"; done | unique_lines
+  )
 
   if [ "${#configs[@]}" -eq 0 ]; then return 1; fi
   if [ "${#configs[@]}" -eq 1 ]; then
@@ -273,36 +399,62 @@ resolve_data_root() {
 }
 
 find_frontend_backend_source() {
-  local root="$1" cfg="$2" data_root candidate
-  data_root="$(resolve_data_root "$root" "$cfg")"
+  local root="$1" cfg="$2" data_root candidate candidate_root root_cfg script_backend
 
   local candidates=()
-  candidates+=("$root/public/scripts/extensions/third-party/$PLUGIN_ID/server-plugins/$PLUGIN_ID")
-  candidates+=("$data_root/default-user/extensions/$PLUGIN_ID/server-plugins/$PLUGIN_ID")
 
-  if [ -d "$data_root" ]; then
-    while IFS= read -r user_dir; do
-      candidates+=("$user_dir/extensions/$PLUGIN_ID/server-plugins/$PLUGIN_ID")
-    done < <(find "$data_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
+  # If this helper itself is running from a bundled backend directory, use it first.
+  # This covers direct execution from:
+  #   .../extensions/cocktail-plus/server-plugins/cocktail-plus/scripts/cocktail-plus-helper.sh
+  # and also helps Termux/proot users whose SillyTavern root is hard to infer.
+  if [ -n "$SCRIPT_DIR" ]; then
+    script_backend="$(abs_path "$SCRIPT_DIR/..")"
+    candidates+=("$script_backend")
   fi
 
-  for candidate in "${candidates[@]}"; do
+  while IFS= read -r candidate_root; do
+    [ -n "$candidate_root" ] || continue
+    [ -d "$candidate_root" ] || continue
+
+    root_cfg="$cfg"
+    [ -f "$candidate_root/config.yaml" ] && root_cfg="$candidate_root/config.yaml"
+    data_root="$(resolve_data_root "$candidate_root" "$root_cfg")"
+
+    candidates+=("$candidate_root/public/scripts/extensions/third-party/$PLUGIN_ID/server-plugins/$PLUGIN_ID")
+    candidates+=("$data_root/default-user/extensions/$PLUGIN_ID/server-plugins/$PLUGIN_ID")
+
+    if [ -d "$data_root" ]; then
+      while IFS= read -r user_dir; do
+        candidates+=("$user_dir/extensions/$PLUGIN_ID/server-plugins/$PLUGIN_ID")
+      done < <(find "$data_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
+    fi
+  done < <(candidate_sillytavern_roots "$root")
+
+  while IFS= read -r candidate; do
     if [ -d "$candidate" ] && [ -f "$candidate/index.mjs" ]; then
       printf '%s\n' "$candidate"
       return 0
     fi
-  done
+  done < <(printf '%s\n' "${candidates[@]}" | unique_lines)
 
   say_warn '已尝试以下前端内置后端插件路径：' >&2
-  for candidate in "${candidates[@]}"; do printf -- '- %s\n' "$candidate" >&2; done
+  printf '%s\n' "${candidates[@]}" | unique_lines | while IFS= read -r candidate; do printf -- '- %s\n' "$candidate" >&2; done
   return 1
 }
 
 install_backend_plugin() {
   ensure_config_selected || return 1
   say_title '安装后端扩展'
-  local src plugins_dir dst backup_dir backup
-  src="$(find_frontend_backend_source "$SELECTED_ROOT" "$SELECTED_CONFIG")" || return 1
+  local src plugins_dir dst backup_dir backup tmp cleanup_tmp
+  cleanup_tmp=""
+  warn_termux_environment_aliases "$SELECTED_ROOT"
+  if ! src="$(find_frontend_backend_source "$SELECTED_ROOT" "$SELECTED_CONFIG")"; then
+    say_warn '未找到前端扩展内置的后端插件目录。'
+    say_info '将尝试直接从 GitHub/Gitee 下载 cocktail-plus 仓库并安装后端插件...'
+    tmp="${TMPDIR:-/tmp}/cocktail-plus-repo-install-$(date +%Y%m%d_%H%M%S)"
+    src="$(clone_cocktail_plus_repo "$tmp")" || { rm -rf "$tmp"; say_warn 'GitHub/Gitee 仓库下载均失败。'; return 1; }
+    cleanup_tmp="$tmp"
+  fi
   plugins_dir="$SELECTED_ROOT/plugins"
   dst="$plugins_dir/$PLUGIN_ID"
   mkdir -p "$plugins_dir"
@@ -316,6 +468,7 @@ install_backend_plugin() {
   fi
 
   cp -R "$src" "$dst"
+  [ -n "$cleanup_tmp" ] && rm -rf "$cleanup_tmp"
   set_config_bool "$SELECTED_CONFIG" enableServerPlugins true
   say_ok "后端插件已安装到：$dst"
   say_warn '请重启 SillyTavern 后生效。'
@@ -788,15 +941,15 @@ clone_cocktail_plus_repo() {
   local repo
   for repo in "${repos[@]}"; do
     rm -rf "$tmp"
-    say_info "下载仓库：$repo"
+    say_info "下载仓库：$repo" >&2
     if git clone --depth 1 "$repo" "$tmp"; then
       if [ -f "$tmp/server-plugins/cocktail-plus/index.mjs" ]; then
         printf '%s/server-plugins/cocktail-plus\n' "$tmp"
         return 0
       fi
-      say_warn "仓库内容不完整：$repo"
+      say_warn "仓库内容不完整：$repo" >&2
     else
-      say_warn "下载失败：$repo"
+      say_warn "下载失败：$repo" >&2
     fi
   done
   return 1
@@ -814,6 +967,7 @@ update_backend_from_repository() {
   if [ -n "$BACKEND_UPDATE_CHECK_PID" ] && kill -0 "$BACKEND_UPDATE_CHECK_PID" 2>/dev/null; then
     kill "$BACKEND_UPDATE_CHECK_PID" 2>/dev/null || true
   fi
+  warn_termux_environment_aliases "$SELECTED_ROOT"
   BACKEND_UPDATE_CHECK_PID=""
   BACKEND_UPDATE_CHECK_STARTED_AT=""
   local target plugins_dir current tmp source remote_version cmp confirm backup_root backup item

@@ -3,20 +3,25 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { HEADER_PREFIX, SERVER_ROOT, VERSION } from './constants.js';
+import { HEADER_PREFIX, VERSION } from './constants.js';
 import { config } from './config.js';
+import { getServerRoot } from './utils.js';
 
-const PUBLIC_ROOT = path.join(SERVER_ROOT, 'public');
 const TARGET_PROXY_MODULE_PATHS = new Set(['/script.js', '/scripts/i18n.js', '/scripts/system-messages.js', '/scripts/extensions.js', '/scripts/welcome-screen.js']);
 
+function getPublicRoot() {
+    return path.join(getServerRoot(), 'public');
+}
+
 function normalizePublicPath(value) {
+    const publicRoot = getPublicRoot();
     let raw = String(value || '').split('?')[0].split('#')[0];
     if (!raw.startsWith('/')) raw = `/${raw}`;
     raw = decodeURIComponent(raw);
     if (!raw.endsWith('.js')) throw new Error('Only JavaScript modules can be proxied');
     if (raw.includes('\0')) throw new Error('Invalid module path');
-    const fullPath = path.resolve(PUBLIC_ROOT, `.${raw}`);
-    if (!fullPath.startsWith(PUBLIC_ROOT + path.sep) && fullPath !== PUBLIC_ROOT) {
+    const fullPath = path.resolve(publicRoot, `.${raw}`);
+    if (!fullPath.startsWith(publicRoot + path.sep) && fullPath !== publicRoot) {
         throw new Error('Module path escapes public root');
     }
     return { publicPath: raw.replace(/\\/g, '/'), fullPath };

@@ -1,12 +1,13 @@
 // @ts-nocheck
 import fs from 'node:fs';
 import path from 'node:path';
-import { API_PREFIX, HEADER_PREFIX, SERVER_ROOT, SW_MESSAGE_SOURCE, VERSION } from './constants.js';
+import { API_PREFIX, HEADER_PREFIX, SW_MESSAGE_SOURCE, VERSION } from './constants.js';
 import { config } from './config.js';
 import { ENDPOINT_LIST } from './endpoint-registry.js';
 import { CHAT_SAVE_HASH_ALGORITHM, chatSaveEndpoint, groupChatSaveEndpoint } from './endpoints/chat-save.js';
 import { settingsGetEndpoint } from './endpoints/settings-get.js';
 import { SETTINGS_HASH_ALGORITHM, settingsSaveEndpoint } from './endpoints/settings-save.js';
+import { getServerRoot } from './utils.js';
 
 function makeFastRoutesLiteral() {
     return ENDPOINT_LIST
@@ -17,7 +18,7 @@ function makeFastRoutesLiteral() {
 function makeTemplatePreloadList() {
     const fallback = ['help.html', 'hotkeys.html', 'formatting.html', 'welcome.html', 'welcomePrompt.html', 'assistantNote.html'];
     try {
-        const dir = path.join(SERVER_ROOT, 'public', 'scripts', 'templates');
+        const dir = path.join(getServerRoot(), 'public', 'scripts', 'templates');
         const names = fs.readdirSync(dir)
             .filter(name => name.endsWith('.html'))
             .sort((a, b) => a.localeCompare(b));

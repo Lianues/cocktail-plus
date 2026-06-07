@@ -22,7 +22,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.7";
+  return "0.1.8";
 }
 var VERSION = readVersion();
 var info = {
@@ -185,6 +185,13 @@ function stableStringify(value) {
 function getDataRoot() {
   return globalThis.DATA_ROOT || process.cwd();
 }
+function isSillyTavernRoot(root) {
+  try {
+    return !!root && fs3.existsSync(path2.join(root, "server.js")) && fs3.existsSync(path2.join(root, "package.json")) && fs3.existsSync(path2.join(root, "public", "index.html"));
+  } catch {
+    return false;
+  }
+}
 function safeStatRecord(filePath, label = filePath) {
   try {
     const stat = fs3.statSync(filePath);
@@ -222,7 +229,10 @@ function readTextIfExists(filePath) {
   }
 }
 function getServerRoot() {
-  return fs3.existsSync(path2.join(SERVER_ROOT, "server.js")) ? SERVER_ROOT : process.cwd();
+  const cwd = process.cwd();
+  if (isSillyTavernRoot(cwd)) return cwd;
+  if (isSillyTavernRoot(SERVER_ROOT)) return SERVER_ROOT;
+  return cwd;
 }
 function getPathValue(obj, pathValue, fallback = void 0) {
   try {
@@ -1506,12 +1516,14 @@ var MARKER_START = "<!-- cocktail-plus early bridge start -->";
 var MARKER_END = "<!-- cocktail-plus early bridge end -->";
 var BRIDGE_SCRIPT_ID = "cocktail-plus-early-bridge";
 var BRIDGE_SRC = `${API_PREFIX}/early/bridge.js`;
-var INDEX_PATH = path8.join(SERVER_ROOT, "public", "index.html");
 var BACKUP_DIR = path8.join(PLUGIN_DIR, "backups");
 var MODULE_IMPORT_MAP_ID = "cocktail-plus-module-import-map";
 var MODULE_PROXY_ENTRY_PATHS = ["/scripts/i18n.js", "/script.js"];
 var MODULE_PROXY_IMPORT_PATHS = ["/script.js", "/scripts/i18n.js", "/scripts/system-messages.js", "/scripts/extensions.js", "/scripts/welcome-screen.js"];
 var MODULE_SCRIPT_PROXY_EXCLUDED_PREFIXES = ["/scripts/extensions/third-party/"];
+function getIndexPath() {
+  return path8.join(getServerRoot(), "public", "index.html");
+}
 function normalizePublicModulePath(value) {
   let out = String(value || "").replace(/\\/g, "/");
   if (!out.startsWith("/")) out = `/${out}`;
@@ -1568,8 +1580,9 @@ function replaceScriptSrcAttribute(tag, nextSrc) {
   return tag;
 }
 function readIndexHtml() {
-  if (!fs9.existsSync(INDEX_PATH)) return "";
-  return fs9.readFileSync(INDEX_PATH, "utf8");
+  const indexPath = getIndexPath();
+  if (!fs9.existsSync(indexPath)) return "";
+  return fs9.readFileSync(indexPath, "utf8");
 }
 function countOccurrences(text, needle) {
   if (!needle) return 0;
@@ -1631,6 +1644,7 @@ ${html.slice(scriptJs.index)}`, mode: "before-script-js" };
 ${html}`, mode: "file-start" };
 }
 function getEarlyBridgeStatus() {
+  const indexPath = getIndexPath();
   const html = readIndexHtml();
   const markerStartCount = countOccurrences(html, MARKER_START);
   const markerEndCount = countOccurrences(html, MARKER_END);
@@ -1643,7 +1657,7 @@ function getEarlyBridgeStatus() {
     autoInstall: !!config.autoInstallEarlyBridge,
     installed,
     upToDate,
-    indexPath: INDEX_PATH,
+    indexPath,
     bridgeSrc: BRIDGE_SRC,
     markerStartCount,
     markerEndCount,
@@ -1652,8 +1666,9 @@ function getEarlyBridgeStatus() {
   };
 }
 function installEarlyBridge(options = {}) {
+  const indexPath = getIndexPath();
   const html = readIndexHtml();
-  if (!html) return { ok: false, error: `index.html not found: ${INDEX_PATH}`, status: getEarlyBridgeStatus() };
+  if (!html) return { ok: false, error: `index.html not found: ${indexPath}`, status: getEarlyBridgeStatus() };
   const beforeStatus = getEarlyBridgeStatus();
   const { html: nextHtml, mode } = insertBridgeBlock(html);
   const finalHtml = rewriteIndexModuleProxyTags(nextHtml);
@@ -1662,12 +1677,13 @@ function installEarlyBridge(options = {}) {
   }
   let backup = null;
   if (!options.noBackup) backup = makeBackup(html);
-  fs9.writeFileSync(INDEX_PATH, finalHtml, "utf8");
+  fs9.writeFileSync(indexPath, finalHtml, "utf8");
   return { ok: true, changed: true, mode, backup, status: getEarlyBridgeStatus() };
 }
 function uninstallEarlyBridge(options = {}) {
+  const indexPath = getIndexPath();
   const html = readIndexHtml();
-  if (!html) return { ok: false, error: `index.html not found: ${INDEX_PATH}`, status: getEarlyBridgeStatus() };
+  if (!html) return { ok: false, error: `index.html not found: ${indexPath}`, status: getEarlyBridgeStatus() };
   const markerRegex = getMarkerRegex();
   markerRegex.lastIndex = 0;
   if (!markerRegex.test(html)) {
@@ -1677,7 +1693,7 @@ function uninstallEarlyBridge(options = {}) {
   const nextHtml = restoreIndexModuleProxyTags(html.replace(markerRegex, "").replace(/\n{3,}/g, "\n\n"));
   let backup = null;
   if (!options.noBackup) backup = makeBackup(html);
-  fs9.writeFileSync(INDEX_PATH, nextHtml, "utf8");
+  fs9.writeFileSync(indexPath, nextHtml, "utf8");
   return { ok: true, changed: true, backup, status: getEarlyBridgeStatus() };
 }
 function makeFastRoutesLiteral() {
@@ -1686,7 +1702,7 @@ function makeFastRoutesLiteral() {
 function makeTemplatePreloadList() {
   const fallback = ["help.html", "hotkeys.html", "formatting.html", "welcome.html", "welcomePrompt.html", "assistantNote.html"];
   try {
-    const dir = path8.join(SERVER_ROOT, "public", "scripts", "templates");
+    const dir = path8.join(getServerRoot(), "public", "scripts", "templates");
     const names = fs9.readdirSync(dir).filter((name) => name.endsWith(".html")).sort((a, b) => a.localeCompare(b));
     const list = names.length ? names : fallback;
     return list.map((name) => `/scripts/templates/${name}`);
@@ -2111,6 +2127,14 @@ ${fastRoutes}
 
   function getMethod(input, init) {
     return String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+  }
+
+  function getCacheMode(input, init) {
+    try {
+      if (init && init.cache) return String(init.cache);
+      if (input instanceof Request && input.cache) return String(input.cache);
+    } catch (_) {}
+    return '';
   }
 
   function cloneHeaders(input, init) {
@@ -3018,8 +3042,13 @@ ${fastRoutes}
         if (extensionResponse) return extensionResponse;
       }
       if (url && url.origin === location.origin && url.pathname.startsWith('/scripts/extensions/') && url.pathname.endsWith('/manifest.json') && method === 'GET') {
-        var manifestResponse = await consumePrefetchRecord(extensionManifestPrefetches.get(url.pathname)?.promise, 'extensions.manifest', Date.now());
-        if (manifestResponse) return manifestResponse;
+        var cacheMode = getCacheMode(input, init);
+        if (cacheMode === 'no-store' || cacheMode === 'reload' || cacheMode === 'no-cache') {
+          remember('extensions.manifest.prefetch-bypass', { path: url.pathname, cache: cacheMode });
+        } else {
+          var manifestResponse = await consumePrefetchRecord(extensionManifestPrefetches.get(url.pathname)?.promise, 'extensions.manifest', Date.now());
+          if (manifestResponse) return manifestResponse;
+        }
       }
       if (url && url.origin === location.origin && url.pathname === '/api/backgrounds/all' && method === 'POST') {
         var backgroundsResponse = await consumePrefetchRecord(backgroundsAllPrefetch, 'backgrounds.all', Date.now());
@@ -3289,7 +3318,7 @@ function makeFastRoutesLiteral2() {
 function makeTemplatePreloadList2() {
   const fallback = ["help.html", "hotkeys.html", "formatting.html", "welcome.html", "welcomePrompt.html", "assistantNote.html"];
   try {
-    const dir = path9.join(SERVER_ROOT, "public", "scripts", "templates");
+    const dir = path9.join(getServerRoot(), "public", "scripts", "templates");
     const names = fs10.readdirSync(dir).filter((name) => name.endsWith(".html")).sort((a, b) => a.localeCompare(b));
     const list = names.length ? names : fallback;
     return list.map((name) => `/scripts/templates/${name}`);
@@ -3922,16 +3951,19 @@ self.addEventListener('fetch', (event) => {
 import crypto2 from "node:crypto";
 import fs11 from "node:fs";
 import path10 from "node:path";
-var PUBLIC_ROOT = path10.join(SERVER_ROOT, "public");
 var TARGET_PROXY_MODULE_PATHS = /* @__PURE__ */ new Set(["/script.js", "/scripts/i18n.js", "/scripts/system-messages.js", "/scripts/extensions.js", "/scripts/welcome-screen.js"]);
+function getPublicRoot() {
+  return path10.join(getServerRoot(), "public");
+}
 function normalizePublicPath(value) {
+  const publicRoot = getPublicRoot();
   let raw = String(value || "").split("?")[0].split("#")[0];
   if (!raw.startsWith("/")) raw = `/${raw}`;
   raw = decodeURIComponent(raw);
   if (!raw.endsWith(".js")) throw new Error("Only JavaScript modules can be proxied");
   if (raw.includes("\0")) throw new Error("Invalid module path");
-  const fullPath = path10.resolve(PUBLIC_ROOT, `.${raw}`);
-  if (!fullPath.startsWith(PUBLIC_ROOT + path10.sep) && fullPath !== PUBLIC_ROOT) {
+  const fullPath = path10.resolve(publicRoot, `.${raw}`);
+  if (!fullPath.startsWith(publicRoot + path10.sep) && fullPath !== publicRoot) {
     throw new Error("Module path escapes public root");
   }
   return { publicPath: raw.replace(/\\/g, "/"), fullPath };
@@ -4328,6 +4360,12 @@ function registerRoutes(router) {
       version: VERSION,
       serviceWorker: { enabled: !!config.serviceWorkerEnabled, url: `${API_PREFIX}/sw.js`, scope: "/" },
       earlyBridge: getEarlyBridgeStatus(),
+      paths: {
+        cwd: process.cwd(),
+        serverRoot: getServerRoot(),
+        dataRoot: getDataRoot(),
+        pluginDir: PLUGIN_DIR
+      },
       stats,
       status: getUserStatus(ctx),
       settingsSave: getSettingsSaveStatus(),

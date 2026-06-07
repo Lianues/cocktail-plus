@@ -21,6 +21,14 @@ export function getDataRoot() {
     return globalThis.DATA_ROOT || process.cwd();
 }
 
+function isSillyTavernRoot(root) {
+    try {
+        return !!root && fs.existsSync(path.join(root, 'server.js')) && fs.existsSync(path.join(root, 'package.json')) && fs.existsSync(path.join(root, 'public', 'index.html'));
+    } catch {
+        return false;
+    }
+}
+
 export function safeStatRecord(filePath, label = filePath) {
     try {
         const stat = fs.statSync(filePath);
@@ -62,7 +70,13 @@ export function readTextIfExists(filePath) {
 }
 
 export function getServerRoot() {
-    return fs.existsSync(path.join(SERVER_ROOT, 'server.js')) ? SERVER_ROOT : process.cwd();
+    const cwd = process.cwd();
+    // In Termux/proot or symlinked installs, the plugin path and the running
+    // process cwd can point at different SillyTavern copies. Prefer the actual
+    // process cwd when it looks like an ST root; fall back to the plugin-derived root.
+    if (isSillyTavernRoot(cwd)) return cwd;
+    if (isSillyTavernRoot(SERVER_ROOT)) return SERVER_ROOT;
+    return cwd;
 }
 
 export function getPathValue(obj, pathValue, fallback = undefined) {

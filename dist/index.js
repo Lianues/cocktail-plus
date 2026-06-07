@@ -687,7 +687,7 @@ function getHelperScriptUrls(fileName) {
 }
 function getWindowsHelperCommand() {
   const urls = getHelperScriptUrls("cocktail-plus-helper.ps1").map((url) => `'${quotePowerShellSingle(url)}'`).join(",");
-  return `$urls=@(${urls}); $p=Join-Path $env:TEMP 'cocktail-plus-helper.ps1'; $ok=$false; foreach($u in $urls){ try { if(Test-Path $p){Remove-Item $p -Force -ErrorAction SilentlyContinue}; Invoke-WebRequest -UseBasicParsing $u -OutFile $p; if((Test-Path $p) -and ((Get-Item $p).Length -gt 0)){ $ok=$true; break } } catch {} }; if($ok){ powershell -NoProfile -ExecutionPolicy Bypass -File $p } else { Write-Host '下载 cocktail-plus 后端脚本助手失败：请检查 GitHub/Gitee 网络。' -ForegroundColor Red }`;
+  return `$urls=@(${urls}); $p=Join-Path $env:TEMP 'cocktail-plus-helper.ps1'; $ok=$false; foreach($u in $urls){ try { if(Test-Path $p){Remove-Item $p -Force -ErrorAction SilentlyContinue}; Invoke-WebRequest -UseBasicParsing $u -OutFile $p; if((Test-Path $p) -and ((Get-Item $p).Length -gt 0)){ $ok=$true; break } } catch {} }; if($ok){ try{ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue }catch{}; try{ Unblock-File -LiteralPath $p -ErrorAction SilentlyContinue }catch{}; & $p } else { Write-Host '下载 cocktail-plus 后端脚本助手失败：请检查 GitHub/Gitee 网络。' -ForegroundColor Red }`;
 }
 function getUnixHelperCommand() {
   const urls = getHelperScriptUrls("cocktail-plus-helper.sh").map((url) => `'${quoteSingle(url)}'`).join(" ");

@@ -14,6 +14,7 @@ import { chatSaveEndpoint, getChatSaveStatus, groupChatSaveEndpoint, handleChatS
 import { getSettingsSaveStatus, handleSettingsSaveFast, settingsSaveEndpoint } from './endpoints/settings-save.js';
 import { clearSettingsGetCache, getSettingsGetStatus, handleSettingsGetFast, settingsGetEndpoint } from './endpoints/settings-get.js';
 import { handleModuleProxy } from './module-proxy.js';
+import { getDataRoot, getServerRoot } from './utils.js';
 
 function sendJson(res, data) {
     res.setHeader(HEADER_PREFIX, VERSION);
@@ -38,6 +39,12 @@ export function registerRoutes(router) {
             version: VERSION,
             serviceWorker: { enabled: !!config.serviceWorkerEnabled, url: `${API_PREFIX}/sw.js`, scope: '/' },
             earlyBridge: getEarlyBridgeStatus(),
+            paths: {
+                cwd: process.cwd(),
+                serverRoot: getServerRoot(),
+                dataRoot: getDataRoot(),
+                pluginDir: PLUGIN_DIR,
+            },
             stats,
             status: getUserStatus(ctx),
             settingsSave: getSettingsSaveStatus(),

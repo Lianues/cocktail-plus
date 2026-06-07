@@ -112,6 +112,12 @@ export type UpdateStatus = {
 export type BackendProbe = {
   ok: boolean;
   version?: string;
+  paths?: {
+    cwd?: string;
+    serverRoot?: string;
+    dataRoot?: string;
+    pluginDir?: string;
+  };
   stats?: Record<string, unknown>;
   status?: CacheEntrySummary[];
   settingsGet?: SettingsGetStatus;
