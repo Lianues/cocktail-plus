@@ -146,8 +146,15 @@ select_config_from_list() {
 
   if [ "${#configs[@]}" -eq 0 ]; then return 1; fi
   if [ "${#configs[@]}" -eq 1 ]; then
-    printf '找到 SillyTavern：%s\n' "$(dirname "${configs[0]}")"
-    read -r -p '使用这个目录？(Y/n) ' yes
+    printf '找到 SillyTavern：%s\n' "$(dirname "${configs[0]}")" >&2
+    local yes=''
+    if [ -r /dev/tty ]; then
+      printf '使用这个目录？(Y/n) ' >/dev/tty
+      read -r yes </dev/tty || yes=''
+    else
+      # 当前函数通常接在管道后面，stdin 已经是候选列表；没有 TTY 时默认使用唯一候选。
+      yes=''
+    fi
     if [ -z "$yes" ] || [[ "$yes" =~ ^[Yy] ]]; then
       printf '%s\n' "${configs[0]}"
       return 0
@@ -155,12 +162,19 @@ select_config_from_list() {
     return 1
   fi
 
-  printf '\n找到多个候选 config.yaml：\n'
+  printf '\n找到多个候选 config.yaml：\n' >&2
   local i
   for ((i=0; i<${#configs[@]}; i++)); do
-    printf '[%d] %s\n' "$((i+1))" "${configs[$i]}"
+    printf '[%d] %s\n' "$((i+1))" "${configs[$i]}" >&2
   done
-  read -r -p '请输入编号，或直接回车取消: ' choice
+  local choice=''
+  if [ -r /dev/tty ]; then
+    printf '请输入编号，或直接回车取消: ' >/dev/tty
+    read -r choice </dev/tty || choice=''
+  else
+    say_warn '当前终端无法读取交互输入，请改用“手动输入 config.yaml 路径”。' >&2
+    return 1
+  fi
   [ -n "$choice" ] || return 1
   if ! [[ "$choice" =~ ^[0-9]+$ ]]; then return 1; fi
   local index=$((choice-1))

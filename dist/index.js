@@ -581,20 +581,9 @@ function quoteSingle(value) {
 function quotePowerShellSingle(value) {
   return String(value).replace(/'/g, "''");
 }
+const HELPER_SCRIPT_BASE_URL = "http://127.0.0.1:8000";
 function getHelperScriptUrl(fileName) {
-  var _a;
-  try {
-    if ((_a = state.backend) == null ? void 0 : _a.ok) {
-      return `${location.origin}/api/plugins/cocktail-plus/helper/${fileName}`;
-    }
-    const url = new URL(import.meta.url);
-    url.pathname = url.pathname.replace(/\/dist\/index\.js$/, `/server-plugins/cocktail-plus/scripts/${fileName}`);
-    url.search = "";
-    url.hash = "";
-    return url.href;
-  } catch {
-    return `${location.origin}/scripts/extensions/third-party/cocktail-plus/server-plugins/cocktail-plus/scripts/${fileName}`;
-  }
+  return `${HELPER_SCRIPT_BASE_URL}/scripts/extensions/third-party/cocktail-plus/server-plugins/cocktail-plus/scripts/${fileName}`;
 }
 function getWindowsHelperCommand() {
   const url = quotePowerShellSingle(getHelperScriptUrl("cocktail-plus-helper.ps1"));

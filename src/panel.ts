@@ -53,19 +53,10 @@ function quotePowerShellSingle(value: string) {
   return String(value).replace(/'/g, "''");
 }
 
+const HELPER_SCRIPT_BASE_URL = 'http://127.0.0.1:8000';
+
 function getHelperScriptUrl(fileName: string) {
-  try {
-    if (state.backend?.ok) {
-      return `${location.origin}/api/plugins/cocktail-plus/helper/${fileName}`;
-    }
-    const url = new URL(import.meta.url);
-    url.pathname = url.pathname.replace(/\/dist\/index\.js$/, `/server-plugins/cocktail-plus/scripts/${fileName}`);
-    url.search = '';
-    url.hash = '';
-    return url.href;
-  } catch {
-    return `${location.origin}/scripts/extensions/third-party/cocktail-plus/server-plugins/cocktail-plus/scripts/${fileName}`;
-  }
+  return `${HELPER_SCRIPT_BASE_URL}/scripts/extensions/third-party/cocktail-plus/server-plugins/cocktail-plus/scripts/${fileName}`;
 }
 
 function getWindowsHelperCommand() {
