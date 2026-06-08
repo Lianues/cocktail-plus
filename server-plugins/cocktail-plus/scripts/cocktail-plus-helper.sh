@@ -550,6 +550,42 @@ install_frontend_extension() {
   say_warn '请刷新浏览器页面。若扩展列表仍旧，尝试 Ctrl+F5 或清理浏览器缓存。'
 }
 
+remove_frontend_extension() {
+  ensure_config_selected || return 1
+  say_title '卸载前端扩展'
+  printf '[1] 卸载给所有人的扩展（public/scripts/extensions/third-party）\n'
+  printf '[2] 卸载某个用户的扩展（data/<账号>/extensions）\n'
+  printf '[0] 返回\n'
+  local scope target user_name data_root confirm
+  read -r -p '请选择卸载范围: ' scope
+  case "$scope" in
+    0) return 0 ;;
+    1) target="$SELECTED_ROOT/public/scripts/extensions/third-party/$PLUGIN_ID" ;;
+    2)
+      read -r -p '请输入账号（例如 default-user）: ' user_name
+      user_name="${user_name%\"}"; user_name="${user_name#\"}"
+      user_name="$(printf '%s' "$user_name" | sed -E "s/^[[:space:]]+|[[:space:]]+$//g; s/^'//; s/'$//")"
+      if [ -z "$user_name" ]; then say_warn '账号不能为空。'; return 0; fi
+      data_root="$(resolve_data_root "$SELECTED_ROOT" "$SELECTED_CONFIG")"
+      target="$data_root/$user_name/extensions/$PLUGIN_ID"
+      ;;
+    *) say_warn '无效选项。'; return 0 ;;
+  esac
+
+  printf '目标目录：%s\n' "$target"
+  if [ ! -e "$target" ]; then
+    say_warn "前端扩展不存在：$target"
+    return 0
+  fi
+
+  read -r -p "确认删除 $target ? (y/N) " confirm
+  if ! [[ "$confirm" =~ ^[Yy] ]]; then say_warn '已取消'; return 0; fi
+
+  rm -rf -- "$target"
+  say_ok '前端扩展已删除。'
+  say_warn '请刷新浏览器页面。若扩展列表仍旧，尝试 Ctrl+F5 或清理浏览器缓存。'
+}
+
 install_backend_plugin() {
   ensure_config_selected || return 1
   say_title '安装后端扩展'
@@ -1352,7 +1388,7 @@ show_menu() {
   printf '重启酒馆本体，输入9\n'
   printf '\n'
   printf '后端扩展和前端扩展更新是独立的，需要分别进行更新\n'
-  printf '后端扩展更新输入10；前端扩展安装/重装输入13，网页面板也可更新前端\n'
+  printf '后端扩展更新输入10；前端扩展安装/重装输入13；卸载前端扩展输入14\n'
   show_backend_update_notice
   printf '\n'
   printf '[1] 自动探测 SillyTavern/config.yaml（酒馆配置文件）\n'
@@ -1368,6 +1404,7 @@ show_menu() {
   printf '[11] 显示当前选择\n'
   printf '[12] 修复 SillyTavern 聊天文件 ENOENT 崩溃问题\n'
   printf '[13] 安装/重新安装 cocktail-plus 前端扩展\n'
+  printf '[14] 卸载 cocktail-plus 前端扩展\n'
   printf '[0] 退出\n'
 }
 
@@ -1395,6 +1432,7 @@ while true; do
     11) show_current_selection ;;
     12) source_patch_menu ;;
     13) install_frontend_extension ;;
+    14) remove_frontend_extension ;;
     0) break ;;
     *) say_warn '无效选项。' ;;
   esac

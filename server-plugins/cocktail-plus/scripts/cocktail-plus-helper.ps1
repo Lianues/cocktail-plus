@@ -427,6 +427,43 @@ function Install-FrontendExtension {
     }
 }
 
+function Remove-FrontendExtension {
+    Ensure-ConfigSelected
+    Write-Title '卸载前端扩展'
+    Write-Host '[1] 卸载给所有人的扩展（public/scripts/extensions/third-party）'
+    Write-Host '[2] 卸载某个用户的扩展（data/<账号>/extensions）'
+    Write-Host '[0] 返回'
+    $scope = Read-Host '请选择卸载范围'
+    if ($scope.Trim() -eq '0') { return }
+
+    $target = $null
+    if ($scope.Trim() -eq '1') {
+        $target = Join-Path $Script:SelectedRoot "public\scripts\extensions\third-party\$PluginId"
+    } elseif ($scope.Trim() -eq '2') {
+        $userName = Read-Host '请输入账号（例如 default-user）'
+        $userName = $userName.Trim().Trim('"').Trim("'")
+        if ([string]::IsNullOrWhiteSpace($userName)) { Write-Warn '账号不能为空。'; return }
+        $dataRoot = Resolve-DataRoot $Script:SelectedRoot $Script:SelectedConfigPath
+        $target = Join-Path $dataRoot (Join-Path $userName "extensions\$PluginId")
+    } else {
+        Write-Warn '无效选项。'
+        return
+    }
+
+    Write-Host "目标目录：$target"
+    if (-not (Test-Path -LiteralPath $target)) {
+        Write-Warn "前端扩展不存在：$target"
+        return
+    }
+
+    $confirm = Read-Host "确认删除 $target ? (y/N)"
+    if ($confirm.Trim().ToLower() -notin @('y', 'yes')) { Write-Warn '已取消'; return }
+
+    Remove-Item -LiteralPath $target -Recurse -Force
+    Write-Ok '前端扩展已删除。'
+    Write-Warn '请刷新浏览器页面。若扩展列表仍旧，尝试 Ctrl+F5 或清理浏览器缓存。'
+}
+
 function Restore-CocktailPlusIndexHtml {
     param(
         [switch]$NoBackup
@@ -1258,7 +1295,7 @@ function Show-Menu {
     Write-Host '重启酒馆本体，输入9'
     Write-Host ''
     Write-Host '后端扩展和前端扩展更新是独立的，需要分别进行更新'
-    Write-Host '后端扩展更新输入10；前端扩展安装/重装输入13，网页面板也可更新前端'
+    Write-Host '后端扩展更新输入10；前端扩展安装/重装输入13；卸载前端扩展输入14'
     Show-BackendUpdateNotice
     Write-Host ''
     Write-Host '[1] 自动探测 SillyTavern/config.yaml（酒馆配置文件）'
@@ -1274,6 +1311,7 @@ function Show-Menu {
     Write-Host '[11] 显示当前选择'
     Write-Host '[12] 修复 SillyTavern 聊天文件 ENOENT 崩溃问题'
     Write-Host '[13] 安装/重新安装 cocktail-plus 前端扩展'
+    Write-Host '[14] 卸载 cocktail-plus 前端扩展'
     Write-Host '[0] 退出'
 }
 
@@ -1302,6 +1340,7 @@ while ($true) {
             '11' { Show-CurrentSelection }
             '12' { Invoke-SillyTavernChatsEnoentPatchMenu }
             '13' { Install-FrontendExtension }
+            '14' { Remove-FrontendExtension }
             '0' { break }
             default { Write-Warn '无效选项。' }
         }

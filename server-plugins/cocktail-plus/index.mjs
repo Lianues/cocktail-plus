@@ -1068,6 +1068,155 @@ var settingsGetStats = {
   lastBuildMs: 0
 };
 var settingsGetCache = /* @__PURE__ */ new Map();
+var REQUEST_COMPRESSION_DEFAULTS = Object.freeze({
+  enabled: false,
+  minPayloadSize: "256kb",
+  maxPayloadSize: "8mb",
+  timeout: 4e3
+});
+var stConfigFallbackCache = null;
+function keyToEnv(key) {
+  return "SILLYTAVERN_" + String(key).toUpperCase().replace(/\./g, "_");
+}
+function toBoolean(value) {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  return Boolean(value);
+}
+function getPathValue2(object, key, fallback = void 0) {
+  try {
+    const parts = String(key).split(".");
+    let current = object;
+    for (const part of parts) {
+      if (current === null || current === void 0 || !Object.prototype.hasOwnProperty.call(current, part)) return fallback;
+      current = current[part];
+    }
+    return current === void 0 ? fallback : current;
+  } catch {
+    return fallback;
+  }
+}
+function stripInlineComment(value) {
+  let quote = "";
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i];
+    if ((char === '"' || char === "'") && value[i - 1] !== "\\") {
+      quote = quote === char ? "" : quote || char;
+    }
+    if (char === "#" && !quote) return value.slice(0, i).trimEnd();
+  }
+  return value.trimEnd();
+}
+function parseYamlScalar(raw) {
+  const value = stripInlineComment(String(raw ?? "").trim());
+  if (value === "") return "";
+  if (value.startsWith('"') && value.endsWith('"') || value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1);
+  const lower = value.toLowerCase();
+  if (lower === "true") return true;
+  if (lower === "false") return false;
+  if (lower === "null") return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);
+  return value;
+}
+function parseSimpleYaml(text) {
+  const root = {};
+  const stack = [{ indent: -1, object: root }];
+  const lines = String(text || "").split(/\r?\n/);
+  for (const line of lines) {
+    if (!line.trim() || line.trimStart().startsWith("#")) continue;
+    const match = line.match(/^(\s*)([^:#][^:]*):(?:\s*(.*))?$/);
+    if (!match) continue;
+    const indent = match[1].replace(/\t/g, "    ").length;
+    const key = match[2].trim();
+    const rawValue = match[3];
+    while (stack.length > 1 && stack[stack.length - 1].indent >= indent) stack.pop();
+    const parent = stack[stack.length - 1].object;
+    if (rawValue === void 0 || stripInlineComment(rawValue).trim() === "") {
+      const child = {};
+      parent[key] = child;
+      stack.push({ indent, object: child });
+    } else {
+      parent[key] = parseYamlScalar(rawValue);
+    }
+  }
+  return root;
+}
+function getFallbackConfig() {
+  if (stConfigFallbackCache) return stConfigFallbackCache;
+  const candidates = [
+    process.env.SILLYTAVERN_CONFIG_PATH,
+    process.env.CONFIG_PATH,
+    globalThis.COMMAND_LINE_ARGS?.configPath,
+    path5.join(getServerRoot(), "config.yaml"),
+    path5.join(getServerRoot(), "config.yml")
+  ].filter(Boolean);
+  for (const filePath of candidates) {
+    try {
+      if (fs6.existsSync(filePath)) {
+        stConfigFallbackCache = parseSimpleYaml(fs6.readFileSync(filePath, "utf8"));
+        return stConfigFallbackCache;
+      }
+    } catch {
+    }
+  }
+  stConfigFallbackCache = {};
+  return stConfigFallbackCache;
+}
+function getRuntimeConfigValue(key, defaultValue = null, typeConverter = null) {
+  const envKey = keyToEnv(key);
+  let value = Object.prototype.hasOwnProperty.call(process.env, envKey) ? process.env[envKey] : getPathValue2(getFallbackConfig(), key, defaultValue);
+  switch (typeConverter) {
+    case "number":
+      return Number.isNaN(parseFloat(value)) ? defaultValue : parseFloat(value);
+    case "boolean":
+      return toBoolean(value);
+    default:
+      return value;
+  }
+}
+function parseByteSize(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const match = String(value ?? "").trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*([kmgt]?i?b?|bytes?)?$/);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) return null;
+  const unit = (match[2] || "b").replace(/bytes?/, "b");
+  const multipliers = { b: 1, k: 1024, kb: 1024, kib: 1024, m: 1024 ** 2, mb: 1024 ** 2, mib: 1024 ** 2, g: 1024 ** 3, gb: 1024 ** 3, gib: 1024 ** 3, t: 1024 ** 4, tb: 1024 ** 4, tib: 1024 ** 4 };
+  return Math.floor(amount * (multipliers[unit] || 1));
+}
+function getSettingsRuntimeConfig() {
+  const [
+    enableExtensions,
+    enableExtensionsAutoUpdate,
+    enableAccounts,
+    requestCompressionEnabled,
+    requestCompressionMin,
+    requestCompressionMax,
+    requestCompressionTimeout
+  ] = [
+    getRuntimeConfigValue("extensions.enabled", true, "boolean"),
+    getRuntimeConfigValue("extensions.autoUpdate", true, "boolean"),
+    getRuntimeConfigValue("enableUserAccounts", false, "boolean"),
+    getRuntimeConfigValue("performance.requestCompression.enabled", REQUEST_COMPRESSION_DEFAULTS.enabled, "boolean"),
+    getRuntimeConfigValue("performance.requestCompression.minPayloadSize", REQUEST_COMPRESSION_DEFAULTS.minPayloadSize),
+    getRuntimeConfigValue("performance.requestCompression.maxPayloadSize", REQUEST_COMPRESSION_DEFAULTS.maxPayloadSize),
+    getRuntimeConfigValue("performance.requestCompression.timeout", REQUEST_COMPRESSION_DEFAULTS.timeout, "number")
+  ];
+  return {
+    enable_extensions: !!enableExtensions,
+    enable_extensions_auto_update: !!enableExtensionsAutoUpdate,
+    enable_accounts: !!enableAccounts,
+    request_compression: {
+      enabled: !!requestCompressionEnabled,
+      minPayloadSize: parseByteSize(requestCompressionMin) || 0,
+      maxPayloadSize: parseByteSize(requestCompressionMax) || 0,
+      timeout: Number(requestCompressionTimeout) || 0
+    }
+  };
+}
 function nowIso2() {
   return (/* @__PURE__ */ new Date()).toISOString();
 }
@@ -1184,7 +1333,8 @@ async function buildSettingsGetPayload(req) {
     instruct,
     context,
     sysprompt,
-    reasoning
+    reasoning,
+    runtimeConfig
   ] = await Promise.all([
     fs6.promises.readFile(settingsPathFromRequest(req), "utf8"),
     readPresetsFromDirectory(directories.koboldAI_Settings, { removeFileExtension: true }),
@@ -1198,7 +1348,8 @@ async function buildSettingsGetPayload(req) {
     readAndParseFromDirectory(directories.instruct),
     readAndParseFromDirectory(directories.context),
     readAndParseFromDirectory(directories.sysprompt),
-    readAndParseFromDirectory(directories.reasoning)
+    readAndParseFromDirectory(directories.reasoning),
+    getSettingsRuntimeConfig()
   ]);
   const payload = {
     settings,
@@ -1218,15 +1369,7 @@ async function buildSettingsGetPayload(req) {
     context,
     sysprompt,
     reasoning,
-    enable_extensions: true,
-    enable_extensions_auto_update: true,
-    enable_accounts: false,
-    request_compression: {
-      enabled: false,
-      minPayloadSize: 262144,
-      maxPayloadSize: 8388608,
-      timeout: 4e3
-    }
+    ...runtimeConfig
   };
   const bodyText = JSON.stringify(payload);
   const responseBytes = Buffer.byteLength(bodyText, "utf8");
