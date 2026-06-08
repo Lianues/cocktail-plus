@@ -263,6 +263,40 @@ function scheduleCharactersRefreshAfterAsyncMiss(source) {
     log("characters async refresh failed", error instanceof Error ? error.message : String(error));
   });
 }
+async function readRequestBodyText(input, init2) {
+  try {
+    const body = init2 == null ? void 0 : init2.body;
+    if (typeof body === "string") return body;
+    if (body instanceof URLSearchParams) return body.toString();
+    if (body instanceof Blob) return await body.text();
+    if (input instanceof Request) return await input.clone().text();
+  } catch {
+  }
+  return "";
+}
+function isCocktailPlusExtensionUpdate(body) {
+  const name = String((body == null ? void 0 : body.extensionName) || "").replace(/^\//, "").trim();
+  return name === EXTENSION_NAME;
+}
+async function maybeHandleCocktailPlusNativeUpdate(baseFetch, input, init2, pathname, method) {
+  if (pathname !== "/api/extensions/update" || method !== "POST") return null;
+  try {
+    const bodyText = await readRequestBodyText(input, init2);
+    const body = bodyText ? JSON.parse(bodyText) : {};
+    if (!isCocktailPlusExtensionUpdate(body)) return null;
+    const response = await baseFetch(`${API_PREFIX}/update/frontend`, {
+      method: "POST",
+      headers: getRequestHeaders(),
+      body: JSON.stringify({ extensionName: `/${EXTENSION_NAME}`, global: !!body.global }),
+      cache: "no-store"
+    });
+    log("native cocktail-plus extension update redirected to backend updater", { status: response.status, global: !!body.global });
+    return response;
+  } catch (error) {
+    log("native cocktail-plus extension update redirect failed", error instanceof Error ? error.message : String(error));
+    return null;
+  }
+}
 function endpointsToInvalidate(pathname) {
   const out = [];
   if (pathname.startsWith("/api/characters/") && pathname !== "/api/characters/all" && pathname !== "/api/characters/get" && pathname !== "/api/characters/chats" && pathname !== "/api/characters/export") out.push("characters-all");
@@ -300,6 +334,8 @@ function installFetchObserver() {
     const startedAt = watched ? performance.now() : 0;
     if (watched) log("window.fetch target observed after extension load", { method: (init2 == null ? void 0 : init2.method) || (input instanceof Request ? input.method : "GET"), controller: ((_b = (_a = navigator.serviceWorker) == null ? void 0 : _a.controller) == null ? void 0 : _b.scriptURL) || "" });
     const method = String((init2 == null ? void 0 : init2.method) || (input instanceof Request ? input.method : "GET")).toUpperCase();
+    const redirectedUpdate = await maybeHandleCocktailPlusNativeUpdate(baseFetch, input, init2, pathname, method);
+    if (redirectedUpdate) return redirectedUpdate;
     const invalidates = method === "POST" ? endpointsToInvalidate(pathname) : [];
     const response = await baseFetch(input, init2);
     if (response.ok && invalidates.length) await notifyInvalidate(baseFetch, invalidates, pathname);
@@ -522,19 +558,34 @@ async function discoverExtensionType(externalId) {
   }
 }
 async function updateFrontendViaApi() {
+  var _a;
   const externalId = guessExternalId();
   const type = await discoverExtensionType(externalId);
+  const payload = { extensionName: externalId, global: type === "global" };
+  if ((_a = state.backend) == null ? void 0 : _a.ok) {
+    const response2 = await fetch(`${API_PREFIX}/update/frontend`, {
+      method: "POST",
+      headers: getRequestHeaders(),
+      body: JSON.stringify(payload),
+      cache: "no-store"
+    });
+    const data2 = await response2.json().catch(() => ({}));
+    if (!response2.ok || (data2 == null ? void 0 : data2.ok) === false) {
+      throw new Error((data2 == null ? void 0 : data2.error) || response2.statusText || String(response2.status));
+    }
+    return { ...data2, externalId, type, global: type === "global", updater: "cocktail-plus-backend" };
+  }
   const response = await fetch("/api/extensions/update", {
     method: "POST",
     headers: getRequestHeaders(),
-    body: JSON.stringify({ extensionName: externalId, global: type === "global" })
+    body: JSON.stringify(payload)
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(text || response.statusText || String(response.status));
   }
   const data = await response.json().catch(() => ({}));
-  return { ...data, externalId, type, global: type === "global" };
+  return { ...data, externalId, type, global: type === "global", updater: "sillytavern" };
 }
 async function checkForUpdates(options = {}) {
   if (state.update.checking) return state.update;

@@ -1,4 +1,4 @@
-import { EXTENSION_NAME } from './constants';
+import { API_PREFIX, EXTENSION_NAME } from './constants';
 import { ensureLocalSettings, updateLocalString } from './settings';
 import { state } from './state';
 import { getCtx, getRequestHeaders, log } from './st-context';
@@ -197,17 +197,33 @@ async function discoverExtensionType(externalId: string) {
 async function updateFrontendViaApi() {
   const externalId = guessExternalId();
   const type = await discoverExtensionType(externalId);
+  const payload = { extensionName: externalId, global: type === 'global' };
+
+  if (state.backend?.ok) {
+    const response = await fetch(`${API_PREFIX}/update/frontend`, {
+      method: 'POST',
+      headers: getRequestHeaders(),
+      body: JSON.stringify(payload),
+      cache: 'no-store',
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data?.ok === false) {
+      throw new Error(data?.error || response.statusText || String(response.status));
+    }
+    return { ...data, externalId, type, global: type === 'global', updater: 'cocktail-plus-backend' };
+  }
+
   const response = await fetch('/api/extensions/update', {
     method: 'POST',
     headers: getRequestHeaders(),
-    body: JSON.stringify({ extensionName: externalId, global: type === 'global' }),
+    body: JSON.stringify(payload),
   });
   if (!response.ok) {
     const text = await response.text().catch(() => '');
     throw new Error(text || response.statusText || String(response.status));
   }
   const data = await response.json().catch(() => ({}));
-  return { ...data, externalId, type, global: type === 'global' };
+  return { ...data, externalId, type, global: type === 'global', updater: 'sillytavern' };
 }
 
 export async function checkForUpdates(options: { manual?: boolean; prompt?: boolean } = {}) {

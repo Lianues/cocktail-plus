@@ -273,7 +273,8 @@ ${fastRoutes}
     versionPath: '/version'
   };
   var EXTENSION_PRELOAD = {
-    enabled: ${JSON.stringify(!!config.patchExtensionManifests)}
+    enabled: ${JSON.stringify(!!config.patchExtensionManifests)},
+    manifestMaxAgeMs: 10000
   };
   var MODULE_PROXY = {
     enabled: ${JSON.stringify(!!config.moduleProxyEnabled)},
@@ -2529,8 +2530,15 @@ ${fastRoutes}
         if (cacheMode === 'no-store' || cacheMode === 'reload' || cacheMode === 'no-cache') {
           remember('extensions.manifest.prefetch-bypass', { path: url.pathname, cache: cacheMode });
         } else {
-          var manifestResponse = await consumePrefetchRecord(extensionManifestPrefetches.get(url.pathname)?.promise, 'extensions.manifest', Date.now());
-          if (manifestResponse) return manifestResponse;
+          var manifestRecord = extensionManifestPrefetches.get(url.pathname);
+          var manifestAgeMs = manifestRecord && manifestRecord.startedAt ? Date.now() - manifestRecord.startedAt : Infinity;
+          if (manifestAgeMs <= EXTENSION_PRELOAD.manifestMaxAgeMs) {
+            var manifestResponse = await consumePrefetchRecord(manifestRecord && manifestRecord.promise, 'extensions.manifest', Date.now());
+            if (manifestResponse) return manifestResponse;
+          } else {
+            if (manifestRecord) extensionManifestPrefetches.delete(url.pathname);
+            remember('extensions.manifest.prefetch-expired', { path: url.pathname, ageMs: manifestAgeMs });
+          }
         }
       }
       if (url && url.origin === location.origin && url.pathname === '/api/backgrounds/all' && method === 'POST') {

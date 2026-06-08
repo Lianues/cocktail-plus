@@ -19,6 +19,7 @@ import { handleRecentChatsFast } from './endpoints/recent-chats.js';
 import { handleModuleProxy } from './module-proxy.js';
 import { getDataRoot, getServerRoot } from './utils.js';
 import { applyChatsEnoentPatch, getChatsEnoentPatchStatus, revertChatsEnoentPatch } from './source-patches.js';
+import { handleFrontendUpdate } from './frontend-update.js';
 
 function sendJson(res, data) {
     res.setHeader(HEADER_PREFIX, VERSION);
@@ -118,6 +119,8 @@ export function registerRoutes(router) {
     router.post('/source-patches/status', async (_req, res) => {
         sendJson(res, { ok: true, chatsEnoentGuard: getChatsEnoentPatchStatus() });
     });
+
+    router.post('/update/frontend', async (req, res) => handleFrontendUpdate(req, res));
 
     router.post('/source-patches/chats-enoent/apply', async (req, res) => {
         const result = applyChatsEnoentPatch();

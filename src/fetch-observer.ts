@@ -1,6 +1,42 @@
-import { API_PREFIX, FETCH_OBSERVER_FLAG, HEADER_PREFIX } from './constants';
+import { API_PREFIX, EXTENSION_NAME, FETCH_OBSERVER_FLAG, HEADER_PREFIX } from './constants';
 import { scheduleCharactersRefreshAfterAsyncMiss } from './characters-refresh';
 import { getRequestHeaders, log } from './st-context';
+
+async function readRequestBodyText(input: RequestInfo | URL, init?: RequestInit) {
+  try {
+    const body = init?.body;
+    if (typeof body === 'string') return body;
+    if (body instanceof URLSearchParams) return body.toString();
+    if (body instanceof Blob) return await body.text();
+    if (input instanceof Request) return await input.clone().text();
+  } catch { /* ignore */ }
+  return '';
+}
+
+function isCocktailPlusExtensionUpdate(body: any) {
+  const name = String(body?.extensionName || '').replace(/^\//, '').trim();
+  return name === EXTENSION_NAME;
+}
+
+async function maybeHandleCocktailPlusNativeUpdate(baseFetch: typeof fetch, input: RequestInfo | URL, init: RequestInit | undefined, pathname: string, method: string) {
+  if (pathname !== '/api/extensions/update' || method !== 'POST') return null;
+  try {
+    const bodyText = await readRequestBodyText(input, init);
+    const body = bodyText ? JSON.parse(bodyText) : {};
+    if (!isCocktailPlusExtensionUpdate(body)) return null;
+    const response = await baseFetch(`${API_PREFIX}/update/frontend`, {
+      method: 'POST',
+      headers: getRequestHeaders(),
+      body: JSON.stringify({ extensionName: `/${EXTENSION_NAME}`, global: !!body.global }),
+      cache: 'no-store',
+    });
+    log('native cocktail-plus extension update redirected to backend updater', { status: response.status, global: !!body.global });
+    return response;
+  } catch (error) {
+    log('native cocktail-plus extension update redirect failed', error instanceof Error ? error.message : String(error));
+    return null;
+  }
+}
 
 function endpointsToInvalidate(pathname: string) {
   const out: string[] = [];
@@ -34,6 +70,8 @@ export function installFetchObserver() {
     const startedAt = watched ? performance.now() : 0;
     if (watched) log('window.fetch target observed after extension load', { pathname, method: init?.method || (input instanceof Request ? input.method : 'GET'), controller: navigator.serviceWorker?.controller?.scriptURL || '' });
     const method = String(init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    const redirectedUpdate = await maybeHandleCocktailPlusNativeUpdate(baseFetch, input, init, pathname, method);
+    if (redirectedUpdate) return redirectedUpdate;
     const invalidates = method === 'POST' ? endpointsToInvalidate(pathname) : [];
     const response = await baseFetch(input as any, init as any);
     if (response.ok && invalidates.length) await notifyInvalidate(baseFetch, invalidates, pathname);

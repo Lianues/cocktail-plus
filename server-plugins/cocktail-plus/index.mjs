@@ -22,7 +22,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.13";
+  return "0.1.14";
 }
 var VERSION = readVersion();
 var info = {
@@ -2099,7 +2099,8 @@ ${fastRoutes}
     versionPath: '/version'
   };
   var EXTENSION_PRELOAD = {
-    enabled: ${JSON.stringify(!!config.patchExtensionManifests)}
+    enabled: ${JSON.stringify(!!config.patchExtensionManifests)},
+    manifestMaxAgeMs: 10000
   };
   var MODULE_PROXY = {
     enabled: ${JSON.stringify(!!config.moduleProxyEnabled)},
@@ -4355,8 +4356,15 @@ ${fastRoutes}
         if (cacheMode === 'no-store' || cacheMode === 'reload' || cacheMode === 'no-cache') {
           remember('extensions.manifest.prefetch-bypass', { path: url.pathname, cache: cacheMode });
         } else {
-          var manifestResponse = await consumePrefetchRecord(extensionManifestPrefetches.get(url.pathname)?.promise, 'extensions.manifest', Date.now());
-          if (manifestResponse) return manifestResponse;
+          var manifestRecord = extensionManifestPrefetches.get(url.pathname);
+          var manifestAgeMs = manifestRecord && manifestRecord.startedAt ? Date.now() - manifestRecord.startedAt : Infinity;
+          if (manifestAgeMs <= EXTENSION_PRELOAD.manifestMaxAgeMs) {
+            var manifestResponse = await consumePrefetchRecord(manifestRecord && manifestRecord.promise, 'extensions.manifest', Date.now());
+            if (manifestResponse) return manifestResponse;
+          } else {
+            if (manifestRecord) extensionManifestPrefetches.delete(url.pathname);
+            remember('extensions.manifest.prefetch-expired', { path: url.pathname, ageMs: manifestAgeMs });
+          }
         }
       }
       if (url && url.origin === location.origin && url.pathname === '/api/backgrounds/all' && method === 'POST') {
@@ -4437,8 +4445,8 @@ function autoEnsureEarlyBridge() {
 }
 
 // server-plugins/cocktail-plus/src/routes.ts
-import fs17 from "node:fs";
-import path16 from "node:path";
+import fs18 from "node:fs";
+import path17 from "node:path";
 
 // server-plugins/cocktail-plus/src/fast-handler.ts
 function makeEntryFromBody(ctx, endpointKey, status, statusText, headers, bodyText, signature, durationMs, transform = null) {
@@ -6649,8 +6657,139 @@ function autoApplySourcePatches() {
   return results;
 }
 
+// server-plugins/cocktail-plus/src/frontend-update.ts
+import childProcess from "node:child_process";
+import fs17 from "node:fs";
+import os from "node:os";
+import path16 from "node:path";
+var JSON_CONTENT_TYPE6 = "application/json; charset=utf-8";
+var FRONTEND_REPOS = Object.freeze([
+  "https://github.com/Lianues/cocktail-plus.git",
+  "https://gitee.com/lianues/cocktail-plus.git"
+]);
+var SKIP_NAMES = /* @__PURE__ */ new Set(["node_modules", ".deploy-backups"]);
+function stamp() {
+  return (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+}
+function sendJson3(res, status, data) {
+  res.status(status).type(JSON_CONTENT_TYPE6).send(JSON.stringify(data));
+}
+function getFrontendExtensionPath(req, isGlobal) {
+  const base = isGlobal ? path16.join(getServerRoot(), "public", "scripts", "extensions", "third-party") : req.user?.directories?.extensions;
+  if (!base) throw new Error("User extensions directory is not available");
+  return path16.join(base, PLUGIN_ID);
+}
+function readVersionFromManifest(dir) {
+  try {
+    const raw = fs17.readFileSync(path16.join(dir, "manifest.json"), "utf8");
+    const version = String(JSON.parse(raw)?.version || "").trim();
+    return version || "";
+  } catch {
+    return "";
+  }
+}
+function assertFrontendSource(dir) {
+  const required = [
+    "manifest.json",
+    path16.join("dist", "index.js"),
+    path16.join("server-plugins", PLUGIN_ID, "index.mjs")
+  ];
+  for (const rel of required) {
+    if (!fs17.existsSync(path16.join(dir, rel))) throw new Error(`Downloaded repository is missing ${rel}`);
+  }
+}
+function runGit(args, cwd = process.cwd()) {
+  return new Promise((resolve, reject) => {
+    childProcess.execFile("git", args, { cwd, windowsHide: true, timeout: 5 * 60 * 1e3 }, (error, stdout, stderr) => {
+      if (error) {
+        const message = String(stderr || stdout || error.message || error).trim();
+        reject(new Error(message || `git ${args.join(" ")} failed`));
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+async function cloneFrontendSource(tempRoot) {
+  let lastError = null;
+  for (const repo of FRONTEND_REPOS) {
+    const cloneDir = path16.join(tempRoot, "repo");
+    try {
+      fs17.rmSync(cloneDir, { recursive: true, force: true });
+      await runGit(["clone", "--depth", "1", repo, cloneDir]);
+      assertFrontendSource(cloneDir);
+      return { sourceDir: cloneDir, repo };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`Failed to download cocktail-plus from GitHub/Gitee${lastError ? `: ${lastError.message}` : ""}`);
+}
+function copyTree(source, destination) {
+  const stat = fs17.statSync(source);
+  if (stat.isDirectory()) {
+    fs17.mkdirSync(destination, { recursive: true });
+    for (const entry of fs17.readdirSync(source, { withFileTypes: true })) {
+      if (SKIP_NAMES.has(entry.name)) continue;
+      copyTree(path16.join(source, entry.name), path16.join(destination, entry.name));
+    }
+    return;
+  }
+  fs17.mkdirSync(path16.dirname(destination), { recursive: true });
+  fs17.copyFileSync(source, destination);
+}
+function replaceDirectory(source, target) {
+  const parent = path16.dirname(target);
+  fs17.mkdirSync(parent, { recursive: true });
+  const backupRoot = path16.join(parent, ".cocktail-plus-backups");
+  let backupPath = "";
+  if (fs17.existsSync(target)) {
+    fs17.mkdirSync(backupRoot, { recursive: true });
+    backupPath = path16.join(backupRoot, `${PLUGIN_ID}-frontend-${stamp()}`);
+    fs17.renameSync(target, backupPath);
+  }
+  try {
+    copyTree(source, target);
+  } catch (error) {
+    fs17.rmSync(target, { recursive: true, force: true });
+    if (backupPath && fs17.existsSync(backupPath) && !fs17.existsSync(target)) {
+      fs17.renameSync(backupPath, target);
+    }
+    throw error;
+  }
+  return backupPath;
+}
+async function handleFrontendUpdate(req, res) {
+  const tempRoot = fs17.mkdtempSync(path16.join(os.tmpdir(), "cocktail-plus-frontend-update-"));
+  try {
+    const isGlobal = !!req.body?.global;
+    const target = getFrontendExtensionPath(req, isGlobal);
+    const beforeVersion = readVersionFromManifest(target);
+    const { sourceDir, repo } = await cloneFrontendSource(tempRoot);
+    const remoteVersion = readVersionFromManifest(sourceDir);
+    const backupPath = replaceDirectory(sourceDir, target);
+    return sendJson3(res, 200, {
+      ok: true,
+      updated: true,
+      global: isGlobal,
+      repo,
+      extensionPath: target,
+      backupPath,
+      previousVersion: beforeVersion || null,
+      version: remoteVersion || null
+    });
+  } catch (error) {
+    return sendJson3(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  } finally {
+    try {
+      fs17.rmSync(tempRoot, { recursive: true, force: true });
+    } catch {
+    }
+  }
+}
+
 // server-plugins/cocktail-plus/src/routes.ts
-function sendJson3(res, data) {
+function sendJson4(res, data) {
   res.setHeader(HEADER_PREFIX, VERSION);
   res.json(data);
 }
@@ -6665,7 +6804,7 @@ function registerFastRoutes(router) {
 function registerRoutes(router) {
   router.post("/probe", async (req, res) => {
     const ctx = makeRequestContext(req, { bodyOverride: {} });
-    sendJson3(res, {
+    sendJson4(res, {
       ok: true,
       plugin: info,
       version: VERSION,
@@ -6714,37 +6853,38 @@ function registerRoutes(router) {
       res.status(404).type("text/plain").send("Not found");
       return;
     }
-    const filePath = path16.join(PLUGIN_DIR, "scripts", fileName);
-    if (!fs17.existsSync(filePath)) {
+    const filePath = path17.join(PLUGIN_DIR, "scripts", fileName);
+    if (!fs18.existsSync(filePath)) {
       res.status(404).type("text/plain").send("Helper script not found");
       return;
     }
     res.setHeader("cache-control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-    res.type("text/plain; charset=utf-8").send(fs17.readFileSync(filePath, "utf8"));
+    res.type("text/plain; charset=utf-8").send(fs18.readFileSync(filePath, "utf8"));
   });
   router.get("/module", async (req, res) => handleModuleProxy(req, res));
   router.post("/early/status", async (_req, res) => {
-    sendJson3(res, { ok: true, status: getEarlyBridgeStatus() });
+    sendJson4(res, { ok: true, status: getEarlyBridgeStatus() });
   });
   router.post("/early/install", async (req, res) => {
     const noBackup = asBoolean(req.body?.noBackup, false);
     const result = installEarlyBridge({ noBackup });
-    sendJson3(res, result);
+    sendJson4(res, result);
   });
   router.post("/early/uninstall", async (req, res) => {
     const noBackup = asBoolean(req.body?.noBackup, false);
     const result = uninstallEarlyBridge({ noBackup });
-    sendJson3(res, result);
+    sendJson4(res, result);
   });
   router.post("/source-patches/status", async (_req, res) => {
-    sendJson3(res, { ok: true, chatsEnoentGuard: getChatsEnoentPatchStatus() });
+    sendJson4(res, { ok: true, chatsEnoentGuard: getChatsEnoentPatchStatus() });
   });
+  router.post("/update/frontend", async (req, res) => handleFrontendUpdate(req, res));
   router.post("/source-patches/chats-enoent/apply", async (req, res) => {
     const result = applyChatsEnoentPatch();
-    sendJson3(res, result);
+    sendJson4(res, result);
   });
   router.post("/source-patches/chats-enoent/revert", async (_req, res) => {
-    sendJson3(res, revertChatsEnoentPatch());
+    sendJson4(res, revertChatsEnoentPatch());
   });
   registerFastRoutes(router);
   router.post(settingsGetEndpoint.fastPath, async (req, res) => handleSettingsGetFast(req, res));
@@ -6765,29 +6905,29 @@ function registerRoutes(router) {
     });
     if (wait) {
       const results = await Promise.all(tasks);
-      sendJson3(res, { ok: true, waited: true, results });
+      sendJson4(res, { ok: true, waited: true, results });
     } else {
       void Promise.all(tasks).catch(() => {
       });
-      sendJson3(res, { ok: true, waited: false, endpoints: endpointKeys });
+      sendJson4(res, { ok: true, waited: false, endpoints: endpointKeys });
     }
   });
   router.post("/invalidate", async (req, res) => {
     const endpointKeys = parseEndpointList(req.body?.endpoints, []);
     const ctx = makeRequestContext(req, { bodyOverride: {} });
     const removed = invalidateForUser(ctx, endpointKeys);
-    sendJson3(res, { ok: true, endpoints: endpointKeys, removed });
+    sendJson4(res, { ok: true, endpoints: endpointKeys, removed });
   });
   router.post("/status", async (req, res) => {
     const ctx = makeRequestContext(req, { bodyOverride: {} });
-    sendJson3(res, { ok: true, stats, status: getUserStatus(ctx), earlyBridge: getEarlyBridgeStatus(), settingsSave: getSettingsSaveStatus(), chatSave: getChatSaveStatus(), settingsGet: getSettingsGetStatus() });
+    sendJson4(res, { ok: true, stats, status: getUserStatus(ctx), earlyBridge: getEarlyBridgeStatus(), settingsSave: getSettingsSaveStatus(), chatSave: getChatSaveStatus(), settingsGet: getSettingsGetStatus() });
   });
   router.post("/cache/clear", async (req, res) => {
     const endpointKeys = parseEndpointList(req.body?.endpoints, ["characters-all"]);
     const ctx = makeRequestContext(req, { bodyOverride: {} });
     const removed = invalidateForUser(ctx, endpointKeys);
     clearSettingsGetCache();
-    sendJson3(res, { ok: true, endpoints: endpointKeys, removed });
+    sendJson4(res, { ok: true, endpoints: endpointKeys, removed });
   });
 }
 
