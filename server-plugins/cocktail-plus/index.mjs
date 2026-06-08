@@ -22,7 +22,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.18";
+  return "0.1.19";
 }
 var VERSION = readVersion();
 var info = {
@@ -6419,34 +6419,16 @@ function patchScriptJs(source) {
     `${indent}};`,
     `${indent}(globalThis.requestIdleCallback || function (cb) { return setTimeout(cb, 1); })(() => { void cpRunPostFirstPaintInit(); });`
   ].join("\n"));
-  if (config.patchStartupInit && fixViewportFunctionRegex.test(out) && readyFirstLoadCallRegex.test(out)) {
-    out = out.replace(fixViewportFunctionRegex, (match) => `${match}
-
-const cpFirstLoadInitPromise = (async () => {
-    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('module.firstLoadInit-start');
-    try {
-        await firstLoadInit();
-    } finally {
-        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('module.firstLoadInit-end');
-    }
-})();`);
-  }
   if (config.patchStartupInit && readyCallbackStartRegex.test(out)) {
     out = out.replace(readyCallbackStartRegex, (match) => `${match}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('ready-callback.enter');
 `);
-  }
-  if (config.patchStartupInit && out.includes("const cpFirstLoadInitPromise") && readyFirstLoadCallRegex.test(out)) {
-    out = out.replace(readyFirstLoadCallRegex, (_match, indent) => [
-      `${indent}// First load starts during module evaluation; wait here only to preserve following beforeunload setup order.`,
-      `${indent}await cpFirstLoadInitPromise;`
-    ].join("\n"));
   }
   patchFlags.bootstrapApplied = out.includes("firstLoadInit.before-version-secrets-locales");
   patchFlags.systemMessagesSettingsApplied = out.includes("firstLoadInit.before-systemMessages-settings-parallel");
   patchFlags.coreDataApplied = out.includes("firstLoadInit.before-core-data-parallel");
   patchFlags.loaderViewportApplied = out.includes("firstLoadInit.before-loader-viewport-parallel");
   patchFlags.postFirstPaintDeferredApplied = out.includes("firstLoadInit.post-first-paint-init-start");
-  patchFlags.readyFirstLoadStartedEarlyApplied = out.includes("module.firstLoadInit-start");
+  patchFlags.readyFirstLoadStartedEarlyApplied = false;
   const firstLoadRegex = /(async\s+function\s+firstLoadInit\s*\(\s*\)\s*\{\r?\n)/;
   patchFlags.firstLoadDiagnosticInserted = config.patchStartupInit && firstLoadRegex.test(out);
   const diagnostic = JSON.stringify({ version: VERSION, ...patchFlags });
