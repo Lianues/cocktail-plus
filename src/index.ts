@@ -16,6 +16,11 @@ async function init() {
   if ((globalThis as any)[EXTENSION_LOADED_FLAG]) return;
   (globalThis as any)[EXTENSION_LOADED_FLAG] = true;
 
+  const shouldRefreshCharactersAfterFastState = (cache: unknown) => {
+    const state = String(cache || '');
+    return state === 'ASYNC-MISS' || state === 'STALE-SIGNATURE';
+  };
+
   ensureLocalSettings();
   const early = (globalThis as any).__cocktailPlusEarlyBridge;
   if (early) {
@@ -25,7 +30,7 @@ async function init() {
       swRegisterStarted: early.swRegisterStarted,
       events: Array.isArray(early.events) ? early.events.slice(-10) : [],
     });
-    if (Array.isArray(early.events) && early.events.some((e: any) => e?.detail?.path === '/api/characters/all' && e?.detail?.cache === 'ASYNC-MISS')) {
+    if (Array.isArray(early.events) && early.events.some((e: any) => e?.detail?.path === '/api/characters/all' && shouldRefreshCharactersAfterFastState(e?.detail?.cache))) {
       scheduleCharactersRefreshAfterAsyncMiss('early-bridge-history');
     }
   } else {
@@ -34,7 +39,7 @@ async function init() {
   window.addEventListener('cocktail-plus:early', (event: any) => {
     const item = event?.detail;
     log(`EARLY: ${item?.type || 'event'}`, item);
-    if (item?.detail?.path === '/api/characters/all' && item?.detail?.cache === 'ASYNC-MISS') scheduleCharactersRefreshAfterAsyncMiss('early-bridge-event');
+    if (item?.detail?.path === '/api/characters/all' && shouldRefreshCharactersAfterFastState(item?.detail?.cache)) scheduleCharactersRefreshAfterAsyncMiss('early-bridge-event');
   });
   installFetchObserver();
   log('extension init', {
@@ -62,9 +67,9 @@ async function init() {
     const data = event.data;
     if (data?.source === SW_MESSAGE_SOURCE) {
       log(`SW: ${data.type || 'message'}`, data);
-      if (data.path === '/api/characters/all' && data.cache === 'ASYNC-MISS') {
+      if (data.path === '/api/characters/all' && shouldRefreshCharactersAfterFastState(data.cache)) {
         try {
-          (globalThis as any).__cocktailPlusEarlyBridge?.updateCharactersLoadProgress?.({ cache: 'ASYNC-MISS', phase: 'requesting', ...(data.progress || {}) });
+          (globalThis as any).__cocktailPlusEarlyBridge?.updateCharactersLoadProgress?.({ cache: data.cache, phase: 'requesting', ...(data.progress || {}) });
         } catch { /* ignore */ }
         scheduleCharactersRefreshAfterAsyncMiss('service-worker-message');
       } else if (data.path === '/api/characters/all' && data.progress) {

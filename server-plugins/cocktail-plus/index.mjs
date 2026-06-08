@@ -1,6 +1,6 @@
 // server-plugins/cocktail-plus/src/cache-store.ts
-import fs8 from "node:fs";
-import path7 from "node:path";
+import fs9 from "node:fs";
+import path8 from "node:path";
 
 // server-plugins/cocktail-plus/src/constants.ts
 import fs from "node:fs";
@@ -22,7 +22,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.11";
+  return "0.1.12";
 }
 var VERSION = readVersion();
 var info = {
@@ -171,6 +171,10 @@ function asBoolean(value, fallback = false) {
 }
 var config = loadConfig();
 
+// server-plugins/cocktail-plus/src/endpoints/characters-all.ts
+import fs4 from "node:fs";
+import path3 from "node:path";
+
 // server-plugins/cocktail-plus/src/utils.ts
 import fs3 from "node:fs";
 import path2 from "node:path";
@@ -253,6 +257,30 @@ function getPathValue(obj, pathValue, fallback = void 0) {
 }
 
 // server-plugins/cocktail-plus/src/endpoints/characters-all.ts
+var JSON_CONTENT_TYPE = "application/json; charset=utf-8";
+var MAX_CARD_TEXT_CHUNK_BYTES = 64 * 1024 * 1024;
+function callProgress(onProgress, patch) {
+  try {
+    if (typeof onProgress === "function") onProgress(patch);
+  } catch {
+  }
+}
+function progressPatch(phase, startedAt, bytesReceived, totalBytes, extra = {}) {
+  const elapsedMs = Math.max(1, Date.now() - startedAt);
+  const speedBps = bytesReceived > 0 ? bytesReceived / (elapsedMs / 1e3) : 0;
+  const hasTotal = Number.isFinite(totalBytes) && totalBytes > 0;
+  const percent = hasTotal ? Math.max(0, Math.min(100, bytesReceived / totalBytes * 100)) : null;
+  const etaMs = hasTotal && speedBps > 0 ? Math.max(0, (totalBytes - bytesReceived) / speedBps * 1e3) : null;
+  return {
+    phase,
+    bytesReceived,
+    totalBytes: hasTotal ? totalBytes : null,
+    speedBps,
+    percent,
+    etaMs,
+    ...extra
+  };
+}
 function toShallowCharacter(character) {
   return {
     shallow: true,
@@ -275,6 +303,184 @@ function toShallowCharacter(character) {
       extensions: {
         fav: getPathValue(character, "data.extensions.fav", false)
       }
+    }
+  };
+}
+function normalizeBoolean(value) {
+  if (value === true || value === "true" || value === "1" || value === 1) return true;
+  return false;
+}
+function normalizeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+function calculateChatSize(chatsRoot, avatarFileName) {
+  let chatSize = 0;
+  let dateLastChat = 0;
+  try {
+    const charDir = path3.join(chatsRoot, String(avatarFileName || "").replace(/\.png$/i, ""));
+    if (!fs4.existsSync(charDir)) return { chatSize, dateLastChat };
+    const chats = fs4.readdirSync(charDir);
+    for (const chat of chats) {
+      try {
+        const stat = fs4.statSync(path3.join(charDir, chat));
+        if (!stat.isFile()) continue;
+        chatSize += stat.size;
+        dateLastChat = Math.max(dateLastChat, stat.mtimeMs);
+      } catch {
+      }
+    }
+  } catch {
+  }
+  return { chatSize, dateLastChat };
+}
+function calculateDataSize(data) {
+  try {
+    return data && typeof data === "object" ? Object.values(data).reduce((acc, val) => acc + String(val).length, 0) : 0;
+  } catch {
+    return 0;
+  }
+}
+function extractPngTextChunks(buffer) {
+  const chunks = [];
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return chunks;
+  let offset = 8;
+  while (offset + 12 <= buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const typeStart = offset + 4;
+    const typeEnd = offset + 8;
+    const dataStart = offset + 8;
+    const dataEnd = dataStart + length;
+    const nextOffset = dataEnd + 4;
+    if (length < 0 || dataEnd > buffer.length || nextOffset > buffer.length) break;
+    const type = buffer.toString("ascii", typeStart, typeEnd);
+    if (type === "tEXt") {
+      const separator = buffer.indexOf(0, dataStart);
+      if (separator >= dataStart && separator < dataEnd) {
+        const keyword = buffer.toString("latin1", dataStart, separator).toLowerCase();
+        if (keyword === "chara" || keyword === "ccv3") {
+          const textLength = dataEnd - separator - 1;
+          if (textLength > MAX_CARD_TEXT_CHUNK_BYTES) {
+            throw new Error(`PNG ${keyword} metadata is too large: ${textLength} bytes`);
+          }
+          const text = buffer.toString("latin1", separator + 1, dataEnd);
+          chunks.push({ keyword, text });
+        }
+      }
+    }
+    if (type === "IEND") break;
+    offset = nextOffset;
+  }
+  return chunks;
+}
+async function readCharacterCardJson(filePath) {
+  const buffer = await fs4.promises.readFile(filePath);
+  const textChunks = extractPngTextChunks(buffer);
+  const selected = textChunks.find((chunk) => chunk.keyword === "ccv3") || textChunks.find((chunk) => chunk.keyword === "chara");
+  if (!selected) throw new Error("No character metadata found");
+  return Buffer.from(selected.text, "base64").toString("utf8");
+}
+function makeShallowCharacterFromCard(raw, avatarFileName, stat, directories) {
+  const data = raw && typeof raw.data === "object" && raw.data !== null ? raw.data : {};
+  const extensions = data.extensions && typeof data.extensions === "object" ? data.extensions : {};
+  const name = String(data.name || raw?.name || path3.basename(avatarFileName, path3.extname(avatarFileName)) || "").trim();
+  if (!name) return null;
+  const tags = normalizeArray(data.tags).length ? normalizeArray(data.tags) : normalizeArray(raw?.tags);
+  const fav = normalizeBoolean(raw?.fav ?? extensions.fav);
+  const { chatSize, dateLastChat } = calculateChatSize(directories.chats, avatarFileName);
+  const createDate = raw?.create_date || data.create_date || new Date(Math.round(stat?.ctimeMs || Date.now())).toISOString();
+  return toShallowCharacter({
+    name,
+    avatar: avatarFileName,
+    chat: raw?.chat || data.chat || "",
+    fav,
+    date_added: stat?.ctimeMs || 0,
+    create_date: createDate,
+    date_last_chat: dateLastChat,
+    chat_size: chatSize,
+    data_size: calculateDataSize(data),
+    tags,
+    data: {
+      name,
+      character_version: data.character_version || raw?.character_version || "",
+      creator: data.creator || raw?.creator || "",
+      creator_notes: data.creator_notes || raw?.creator_notes || raw?.creatorcomment || "",
+      tags,
+      extensions: {
+        fav
+      }
+    }
+  });
+}
+async function processCharacterFileDirect(fileName, directories) {
+  const filePath = path3.join(directories.characters, fileName);
+  const stat = await fs4.promises.stat(filePath);
+  const jsonText = await readCharacterCardJson(filePath);
+  const raw = JSON.parse(jsonText);
+  return { character: makeShallowCharacterFromCard(raw, fileName, stat, directories), stat };
+}
+async function fetchCharactersAllDirect(ctx, config2, options = {}) {
+  if (!config2.shallowCharactersAll) return null;
+  const startedAt = Date.now();
+  const onProgress = options?.onProgress;
+  const directories = ctx.directories || {};
+  const charactersDir = directories.characters;
+  if (!charactersDir) throw new Error("Characters directory is not available");
+  callProgress(onProgress, progressPatch("scanning", startedAt, 0, null, { status: null, error: null }));
+  const dirents = await fs4.promises.readdir(charactersDir, { withFileTypes: true });
+  const pngFiles = dirents.filter((entry) => entry.isFile() && path3.extname(entry.name).toLowerCase() === ".png").map((entry) => entry.name).sort((a, b) => a.localeCompare(b));
+  const fileStats = /* @__PURE__ */ new Map();
+  let totalBytes = 0;
+  for (const fileName of pngFiles) {
+    try {
+      const stat = await fs4.promises.stat(path3.join(charactersDir, fileName));
+      fileStats.set(fileName, stat);
+      totalBytes += stat.size;
+    } catch {
+    }
+  }
+  const characters = [];
+  let processedBytes = 0;
+  let errors = 0;
+  let lastEmitAt = 0;
+  callProgress(onProgress, progressPatch("reading", startedAt, 0, totalBytes, { count: 0, totalCount: pngFiles.length }));
+  for (let index = 0; index < pngFiles.length; index++) {
+    const fileName = pngFiles[index];
+    const stat = fileStats.get(fileName);
+    try {
+      const { character } = await processCharacterFileDirect(fileName, directories);
+      if (character?.name) characters.push(character);
+    } catch (error) {
+      errors++;
+      console.warn(`[cocktail-plus] Could not build shallow character cache entry for ${fileName}:`, error instanceof Error ? error.message : error);
+    } finally {
+      processedBytes += stat?.size || 0;
+      const now = Date.now();
+      if (now - lastEmitAt >= 100 || index === pngFiles.length - 1) {
+        lastEmitAt = now;
+        callProgress(onProgress, progressPatch("reading", startedAt, processedBytes, totalBytes, { count: index + 1, totalCount: pngFiles.length, errors }));
+      }
+    }
+  }
+  callProgress(onProgress, progressPatch("transforming", startedAt, processedBytes, totalBytes, { count: characters.length, totalCount: pngFiles.length, errors, etaMs: 0 }));
+  const bodyText = JSON.stringify(characters);
+  const cachedBytes = Buffer.byteLength(bodyText, "utf8");
+  const durationMs = Date.now() - startedAt;
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: { "content-type": JSON_CONTENT_TYPE },
+    bodyText,
+    durationMs,
+    bytesReceived: processedBytes,
+    totalBytes,
+    transform: {
+      transformed: true,
+      direct: true,
+      sourceBytes: processedBytes,
+      cachedBytes,
+      count: characters.length,
+      errors
     }
   };
 }
@@ -303,7 +509,7 @@ function makeAsyncMiss(ctx, signature, config2) {
     state: "ASYNC-MISS",
     status: 200,
     statusText: "OK",
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: { "content-type": JSON_CONTENT_TYPE },
     extraResponseHeaders: {
       [`${HEADER_PREFIX}-async`]: "1",
       [`${HEADER_PREFIX}-retry-after-ms`]: "1000"
@@ -322,13 +528,15 @@ var charactersAllEndpoint = {
   diskCacheConfigKey: "diskCacheCharactersAll",
   method: "POST",
   getSignature: getCharactersSignature,
+  fetchForCache: fetchCharactersAllDirect,
+  staleOnSignatureChange: true,
   transformBodyForCache,
   makeAsyncMiss
 };
 
 // server-plugins/cocktail-plus/src/endpoints/chat-save.ts
-import fs4 from "node:fs";
-import path3 from "node:path";
+import fs5 from "node:fs";
+import path4 from "node:path";
 
 // server-plugins/cocktail-plus/src/original-fetch.ts
 function pickResponseHeaders(response) {
@@ -337,7 +545,7 @@ function pickResponseHeaders(response) {
   headers["content-type"] = contentType || "application/json; charset=utf-8";
   return headers;
 }
-function callProgress(onProgress, patch) {
+function callProgress2(onProgress, patch) {
   try {
     if (typeof onProgress === "function") onProgress(patch);
   } catch {
@@ -348,7 +556,7 @@ function parseContentLength(response) {
   const value = Number(raw);
   return Number.isFinite(value) && value > 0 ? value : null;
 }
-function progressPatch(phase, startedAt, bytesReceived, totalBytes, extra = {}) {
+function progressPatch2(phase, startedAt, bytesReceived, totalBytes, extra = {}) {
   const elapsedMs = Math.max(1, Date.now() - startedAt);
   const speedBps = bytesReceived > 0 ? bytesReceived / (elapsedMs / 1e3) : 0;
   const hasTotal = Number.isFinite(totalBytes) && totalBytes > 0;
@@ -368,7 +576,7 @@ async function readBodyWithProgress(response, onProgress, startedAt) {
   const totalBytes = parseContentLength(response);
   let bytesReceived = 0;
   let lastEmitAt = 0;
-  callProgress(onProgress, progressPatch("downloading", startedAt, 0, totalBytes, { status: response.status }));
+  callProgress2(onProgress, progressPatch2("downloading", startedAt, 0, totalBytes, { status: response.status }));
   if (response.body && typeof response.body.getReader === "function") {
     const reader = response.body.getReader();
     const chunks = [];
@@ -382,15 +590,15 @@ async function readBodyWithProgress(response, onProgress, startedAt) {
       const now = Date.now();
       if (now - lastEmitAt >= 100) {
         lastEmitAt = now;
-        callProgress(onProgress, progressPatch("downloading", startedAt, bytesReceived, totalBytes, { status: response.status }));
+        callProgress2(onProgress, progressPatch2("downloading", startedAt, bytesReceived, totalBytes, { status: response.status }));
       }
     }
-    callProgress(onProgress, progressPatch("downloading", startedAt, bytesReceived, totalBytes, { status: response.status, etaMs: 0, percent: totalBytes ? 100 : null }));
+    callProgress2(onProgress, progressPatch2("downloading", startedAt, bytesReceived, totalBytes, { status: response.status, etaMs: 0, percent: totalBytes ? 100 : null }));
     return { bodyText: Buffer.concat(chunks).toString("utf8"), bytesReceived, totalBytes };
   }
   const bodyText = await response.text();
   bytesReceived = Buffer.byteLength(bodyText || "", "utf8");
-  callProgress(onProgress, progressPatch("downloading", startedAt, bytesReceived, totalBytes || bytesReceived, { status: response.status, etaMs: 0, percent: 100 }));
+  callProgress2(onProgress, progressPatch2("downloading", startedAt, bytesReceived, totalBytes || bytesReceived, { status: response.status, etaMs: 0, percent: 100 }));
   return { bodyText, bytesReceived, totalBytes: totalBytes || bytesReceived };
 }
 async function fetchOriginal(ctx, endpoint, options = {}) {
@@ -413,9 +621,9 @@ async function fetchOriginal(ctx, endpoint, options = {}) {
     if (method !== "GET" && method !== "HEAD") {
       fetchOptions.body = ctx.bodyText;
     }
-    callProgress(onProgress, { phase: "requesting", startedAt, bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, status: null, error: null });
+    callProgress2(onProgress, { phase: "requesting", startedAt, bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, status: null, error: null });
     const response = await fetch(url, fetchOptions);
-    callProgress(onProgress, { phase: "downloading", status: response.status, totalBytes: parseContentLength(response), bytesReceived: 0, speedBps: 0, percent: null, etaMs: null });
+    callProgress2(onProgress, { phase: "downloading", status: response.status, totalBytes: parseContentLength(response), bytesReceived: 0, speedBps: 0, percent: null, etaMs: null });
     const { bodyText, bytesReceived, totalBytes } = await readBodyWithProgress(response, onProgress, startedAt);
     const durationMs = Date.now() - startedAt;
     return { ok: response.ok, status: response.status, statusText: response.statusText, headers: pickResponseHeaders(response), bodyText, durationMs, bytesReceived, totalBytes };
@@ -515,18 +723,18 @@ function sanitizeFileName(value) {
   let out = asString(value).replace(/[<>:"/\\|?*\x00-\x1F]/g, "").replace(/[\u{0080}-\u{009F}]/gu, "").trim();
   if (!out || /^\.+$/.test(out)) out = "untitled";
   if (out.length > 240) {
-    const ext = path3.extname(out);
+    const ext = path4.extname(out);
     out = out.slice(0, Math.max(1, 240 - ext.length)) + ext;
   }
   return out;
 }
 function isPathUnderParent(parent, candidate) {
-  const relative = path3.relative(parent, candidate);
-  return !!relative && !relative.startsWith("..") && !path3.isAbsolute(relative);
+  const relative = path4.relative(parent, candidate);
+  return !!relative && !relative.startsWith("..") && !path4.isAbsolute(relative);
 }
 function getSafeStat(filePath) {
   try {
-    const stat = fs4.statSync(filePath);
+    const stat = fs5.statSync(filePath);
     return { exists: true, size: stat.size, mtimeMs: Math.round(stat.mtimeMs), file: stat.isFile() };
   } catch {
     return { exists: false, size: 0, mtimeMs: 0, file: false };
@@ -551,8 +759,8 @@ function parseJsonl(text) {
 }
 function readChatFromFile(filePath) {
   try {
-    if (!fs4.existsSync(filePath)) return [];
-    return parseJsonl(fs4.readFileSync(filePath, "utf8"));
+    if (!fs5.existsSync(filePath)) return [];
+    return parseJsonl(fs5.readFileSync(filePath, "utf8"));
   } catch {
     return [];
   }
@@ -589,7 +797,7 @@ function makeDescriptor(req, endpoint, body) {
     if (!id) throw new Error("group chat id is required");
     const root = req?.user?.directories?.groupChats;
     if (!root) throw new Error("User group chats directory is unavailable");
-    const filePath2 = path3.join(root, sanitizeFileName(`${id}.jsonl`));
+    const filePath2 = path4.join(root, sanitizeFileName(`${id}.jsonl`));
     if (!isPathUnderParent(root, filePath2)) throw new Error("Resolved group chat path is outside user directory");
     return {
       kind,
@@ -608,8 +816,8 @@ function makeDescriptor(req, endpoint, body) {
   const chatsRoot = req?.user?.directories?.chats;
   if (!chatsRoot) throw new Error("User chats directory is unavailable");
   const cardName = avatarUrl.replace(/\.png$/i, "");
-  const directoryPath = path3.join(chatsRoot, cardName);
-  const filePath = path3.join(directoryPath, sanitizeFileName(`${fileName}.jsonl`));
+  const directoryPath = path4.join(chatsRoot, cardName);
+  const filePath = path4.join(directoryPath, sanitizeFileName(`${fileName}.jsonl`));
   if (!isPathUnderParent(chatsRoot, filePath)) throw new Error("Resolved chat path is outside user directory");
   return {
     kind,
@@ -835,10 +1043,10 @@ async function handleChatSaveFast(req, res, endpoint = chatSaveEndpoint) {
 }
 
 // server-plugins/cocktail-plus/src/endpoints/settings-get.ts
-import fs5 from "node:fs";
-import path4 from "node:path";
+import fs6 from "node:fs";
+import path5 from "node:path";
 var SETTINGS_FILE = "settings.json";
-var JSON_CONTENT_TYPE = "application/json; charset=utf-8";
+var JSON_CONTENT_TYPE2 = "application/json; charset=utf-8";
 var settingsGetEndpoint = {
   key: "settings-get",
   aliases: ["settings-get", "/api/settings/get"],
@@ -866,19 +1074,19 @@ function nowIso2() {
 function settingsPathFromRequest(req) {
   const root = req?.user?.directories?.root;
   if (!root) throw new Error("User settings root directory is unavailable");
-  return path4.join(root, SETTINGS_FILE);
+  return path5.join(root, SETTINGS_FILE);
 }
 async function listFiles(directoryPath, fileExtension = ".json") {
   try {
-    const files = await fs5.promises.readdir(directoryPath);
-    return files.filter((name) => path4.extname(name).toLowerCase() === fileExtension).sort((a, b) => a.localeCompare(b));
+    const files = await fs6.promises.readdir(directoryPath);
+    return files.filter((name) => path5.extname(name).toLowerCase() === fileExtension).sort((a, b) => a.localeCompare(b));
   } catch {
     return [];
   }
 }
 async function safeStatRecordAsync(filePath, label = filePath) {
   try {
-    const stat = await fs5.promises.stat(filePath);
+    const stat = await fs6.promises.stat(filePath);
     return { label, exists: true, file: stat.isFile(), directory: stat.isDirectory(), size: stat.size, mtimeMs: Math.round(stat.mtimeMs) };
   } catch {
     return { label, exists: false };
@@ -886,13 +1094,13 @@ async function safeStatRecordAsync(filePath, label = filePath) {
 }
 async function safeDirectoryRecords(dirPath, label, extensions = null) {
   try {
-    const names = (await fs5.promises.readdir(dirPath)).sort((a, b) => a.localeCompare(b));
+    const names = (await fs6.promises.readdir(dirPath)).sort((a, b) => a.localeCompare(b));
     const filtered = names.filter((name) => {
       if (name.startsWith(".")) return false;
-      const ext = path4.extname(name).toLowerCase();
+      const ext = path5.extname(name).toLowerCase();
       return !extensions || extensions.includes(ext);
     });
-    return await Promise.all(filtered.map((name) => safeStatRecordAsync(path4.join(dirPath, name), `${label}/${name}`)));
+    return await Promise.all(filtered.map((name) => safeStatRecordAsync(path5.join(dirPath, name), `${label}/${name}`)));
   } catch {
     return [{ label, exists: false }];
   }
@@ -925,8 +1133,8 @@ async function readPresetsFromDirectory(directoryPath, options = {}) {
   const files = await listFiles(directoryPath, fileExtension);
   const rows = await Promise.all(files.map(async (fileName) => {
     try {
-      const filePath = path4.join(directoryPath, fileName);
-      const text = await fs5.promises.readFile(filePath, "utf8");
+      const filePath = path5.join(directoryPath, fileName);
+      const text = await fs6.promises.readFile(filePath, "utf8");
       if (fileExtension === ".json") JSON.parse(text);
       return {
         name: removeFileExtension ? fileName.replace(/\.[^/.]+$/, "") : fileName,
@@ -947,8 +1155,8 @@ async function readAndParseFromDirectory(directoryPath, fileExtension = ".json")
   const files = await listFiles(directoryPath, fileExtension);
   const rows = await Promise.all(files.map(async (fileName) => {
     try {
-      const filePath = path4.join(directoryPath, fileName);
-      const text = await fs5.promises.readFile(filePath, "utf8");
+      const filePath = path5.join(directoryPath, fileName);
+      const text = await fs6.promises.readFile(filePath, "utf8");
       return fileExtension === ".json" ? JSON.parse(text) : text;
     } catch {
       return null;
@@ -958,7 +1166,7 @@ async function readAndParseFromDirectory(directoryPath, fileExtension = ".json")
 }
 async function readWorldNames(directoryPath) {
   const files = await listFiles(directoryPath, ".json");
-  return files.map((item) => path4.parse(item).name);
+  return files.map((item) => path5.parse(item).name);
 }
 async function buildSettingsGetPayload(req) {
   const directories = req.user?.directories || {};
@@ -978,7 +1186,7 @@ async function buildSettingsGetPayload(req) {
     sysprompt,
     reasoning
   ] = await Promise.all([
-    fs5.promises.readFile(settingsPathFromRequest(req), "utf8"),
+    fs6.promises.readFile(settingsPathFromRequest(req), "utf8"),
     readPresetsFromDirectory(directories.koboldAI_Settings, { removeFileExtension: true }),
     readPresetsFromDirectory(directories.novelAI_Settings, { removeFileExtension: true }),
     readPresetsFromDirectory(directories.openAI_Settings, { removeFileExtension: true }),
@@ -1046,7 +1254,7 @@ function sendBody(res, status, bodyText, state, result = null) {
     res.setHeader(`${HEADER_PREFIX}-settings-get-build-ms`, String(result.buildMs || 0));
     res.setHeader(`${HEADER_PREFIX}-settings-get-bytes`, String(result.responseBytes || 0));
   }
-  res.setHeader("content-type", JSON_CONTENT_TYPE);
+  res.setHeader("content-type", JSON_CONTENT_TYPE2);
   res.send(bodyText ?? "{}");
 }
 function getSettingsGetStatus() {
@@ -1107,8 +1315,8 @@ async function handleSettingsGetFast(req, res) {
 }
 
 // server-plugins/cocktail-plus/src/endpoints/settings-save.ts
-import fs6 from "node:fs";
-import path5 from "node:path";
+import fs7 from "node:fs";
+import path6 from "node:path";
 var SETTINGS_FILE2 = "settings.json";
 var SETTINGS_HASH_ALGORITHM = "cp-stable-sha256-v1";
 var settingsSaveEndpoint = {
@@ -1143,11 +1351,11 @@ function hashSettings(value) {
 function settingsPathFromRequest2(req) {
   const root = req?.user?.directories?.root;
   if (!root) throw new Error("User settings root directory is unavailable");
-  return path5.join(root, SETTINGS_FILE2);
+  return path6.join(root, SETTINGS_FILE2);
 }
 function readCurrentSettings(req) {
   const settingsPath = settingsPathFromRequest2(req);
-  const text = fs6.readFileSync(settingsPath, "utf8");
+  const text = fs7.readFileSync(settingsPath, "utf8");
   return { settingsPath, text, settings: JSON.parse(text) };
 }
 function cloneJson2(value) {
@@ -1331,22 +1539,22 @@ async function handleSettingsSaveFast(req, res) {
 }
 
 // server-plugins/cocktail-plus/src/endpoints/version.ts
-import fs7 from "node:fs";
-import path6 from "node:path";
+import fs8 from "node:fs";
+import path7 from "node:path";
 function getGitHeadInfo(serverRoot = getServerRoot()) {
-  const gitDir = path6.join(serverRoot, ".git");
-  const headPath = path6.join(gitDir, "HEAD");
+  const gitDir = path7.join(serverRoot, ".git");
+  const headPath = path7.join(gitDir, "HEAD");
   const head = readTextIfExists(headPath);
   let branch = null;
   let revision = null;
   let refPath = null;
   if (head.startsWith("ref:")) {
     const ref = head.slice(4).trim();
-    branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : path6.basename(ref);
-    refPath = path6.join(gitDir, ...ref.split("/"));
+    branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : path7.basename(ref);
+    refPath = path7.join(gitDir, ...ref.split("/"));
     revision = readTextIfExists(refPath) || null;
     if (!revision) {
-      const packedRefs = readTextIfExists(path6.join(gitDir, "packed-refs"));
+      const packedRefs = readTextIfExists(path7.join(gitDir, "packed-refs"));
       const line = packedRefs.split(/\r?\n/g).find((x) => x && !x.startsWith("#") && x.endsWith(` ${ref}`));
       revision = line ? line.split(" ")[0] : null;
     }
@@ -1358,9 +1566,9 @@ function getGitHeadInfo(serverRoot = getServerRoot()) {
 function getVersionSignature(ctx) {
   const serverRoot = getServerRoot();
   const git = getGitHeadInfo(serverRoot);
-  const records = [safeStatRecord(path6.join(serverRoot, "package.json"), "package.json"), safeStatRecord(git.headPath, ".git/HEAD")];
+  const records = [safeStatRecord(path7.join(serverRoot, "package.json"), "package.json"), safeStatRecord(git.headPath, ".git/HEAD")];
   if (git.refPath) records.push(safeStatRecord(git.refPath, `.git/refs/heads/${git.branch}`));
-  records.push(safeStatRecord(path6.join(git.gitDir, "packed-refs"), ".git/packed-refs"));
+  records.push(safeStatRecord(path7.join(git.gitDir, "packed-refs"), ".git/packed-refs"));
   records.push({ label: "head", value: git.head });
   records.push({ label: "revision", value: git.revision || "" });
   return signatureFromRecords(records);
@@ -1369,7 +1577,7 @@ function buildFastVersionObject(ctx) {
   const serverRoot = getServerRoot();
   let pkgVersion = "UNKNOWN";
   try {
-    const pkg = JSON.parse(fs7.readFileSync(path6.join(serverRoot, "package.json"), "utf8"));
+    const pkg = JSON.parse(fs8.readFileSync(path7.join(serverRoot, "package.json"), "utf8"));
     pkgVersion = String(pkg.version || "UNKNOWN");
   } catch {
   }
@@ -1469,14 +1677,14 @@ var inflight = /* @__PURE__ */ new Map();
 var refreshProgress = /* @__PURE__ */ new Map();
 var PROGRESS_RETENTION_MS = 30 * 1e3;
 function getDiskRoot() {
-  return path7.join(PLUGIN_DIR, "cache");
+  return path8.join(PLUGIN_DIR, "cache");
 }
 function getCacheKey2(ctx, endpointKey) {
   return `${ctx.userKey}:${endpointKey}:${sha256(ctx.bodyText).slice(0, 32)}`;
 }
 function getDiskCachePath(ctx, endpointKey) {
   const bodyHash = sha256(ctx.bodyText).slice(0, 32);
-  return path7.join(getDiskRoot(), ctx.userKey, `${endpointKey}-${bodyHash}.json`);
+  return path8.join(getDiskRoot(), ctx.userKey, `${endpointKey}-${bodyHash}.json`);
 }
 function shouldUseDiskCache(endpointKey) {
   const endpoint = ENDPOINTS[endpointKey];
@@ -1487,8 +1695,8 @@ function readDiskEntry(ctx, endpointKey) {
   if (!shouldUseDiskCache(endpointKey)) return null;
   try {
     const file = getDiskCachePath(ctx, endpointKey);
-    if (!fs8.existsSync(file)) return null;
-    const entry = JSON.parse(fs8.readFileSync(file, "utf8"));
+    if (!fs9.existsSync(file)) return null;
+    const entry = JSON.parse(fs9.readFileSync(file, "utf8"));
     if (!entry || typeof entry.bodyText !== "string") return null;
     return entry;
   } catch {
@@ -1499,16 +1707,16 @@ function writeDiskEntry(ctx, endpointKey, entry) {
   if (!shouldUseDiskCache(endpointKey)) return;
   try {
     const file = getDiskCachePath(ctx, endpointKey);
-    fs8.mkdirSync(path7.dirname(file), { recursive: true });
-    fs8.writeFileSync(file, JSON.stringify(entry), "utf8");
+    fs9.mkdirSync(path8.dirname(file), { recursive: true });
+    fs9.writeFileSync(file, JSON.stringify(entry), "utf8");
   } catch {
   }
 }
 function listDiskEntriesForUser(ctx) {
-  const dir = path7.join(getDiskRoot(), ctx.userKey);
+  const dir = path8.join(getDiskRoot(), ctx.userKey);
   try {
-    if (!fs8.existsSync(dir)) return [];
-    return fs8.readdirSync(dir).filter((name) => name.endsWith(".json")).map((name) => path7.join(dir, name));
+    if (!fs9.existsSync(dir)) return [];
+    return fs9.readdirSync(dir).filter((name) => name.endsWith(".json")).map((name) => path8.join(dir, name));
   } catch {
     return [];
   }
@@ -1642,10 +1850,10 @@ function invalidateForUser(ctx, endpointKeys) {
     }
   }
   for (const file of listDiskEntriesForUser(ctx)) {
-    const base = path7.basename(file);
+    const base = path8.basename(file);
     if (endpointKeys.some((endpointKey) => base.startsWith(`${endpointKey}-`))) {
       try {
-        fs8.rmSync(file, { force: true });
+        fs9.rmSync(file, { force: true });
         removed++;
       } catch {
       }
@@ -1661,19 +1869,19 @@ function clearCacheStores() {
 }
 
 // server-plugins/cocktail-plus/src/early-bridge.ts
-import fs9 from "node:fs";
-import path8 from "node:path";
+import fs10 from "node:fs";
+import path9 from "node:path";
 var MARKER_START = "<!-- cocktail-plus early bridge start -->";
 var MARKER_END = "<!-- cocktail-plus early bridge end -->";
 var BRIDGE_SCRIPT_ID = "cocktail-plus-early-bridge";
 var BRIDGE_SRC = `${API_PREFIX}/early/bridge.js`;
-var BACKUP_DIR = path8.join(PLUGIN_DIR, "backups");
+var BACKUP_DIR = path9.join(PLUGIN_DIR, "backups");
 var MODULE_IMPORT_MAP_ID = "cocktail-plus-module-import-map";
 var MODULE_PROXY_ENTRY_PATHS = ["/scripts/i18n.js", "/script.js"];
 var MODULE_PROXY_IMPORT_PATHS = ["/script.js", "/scripts/i18n.js", "/scripts/system-messages.js", "/scripts/extensions.js", "/scripts/welcome-screen.js"];
 var MODULE_SCRIPT_PROXY_EXCLUDED_PREFIXES = ["/scripts/extensions/third-party/"];
 function getIndexPath() {
-  return path8.join(getServerRoot(), "public", "index.html");
+  return path9.join(getServerRoot(), "public", "index.html");
 }
 function normalizePublicModulePath(value) {
   let out = String(value || "").replace(/\\/g, "/");
@@ -1732,8 +1940,8 @@ function replaceScriptSrcAttribute(tag, nextSrc) {
 }
 function readIndexHtml() {
   const indexPath = getIndexPath();
-  if (!fs9.existsSync(indexPath)) return "";
-  return fs9.readFileSync(indexPath, "utf8");
+  if (!fs10.existsSync(indexPath)) return "";
+  return fs10.readFileSync(indexPath, "utf8");
 }
 function countOccurrences(text, needle) {
   if (!needle) return 0;
@@ -1746,9 +1954,9 @@ function escapeRegExp(text) {
   return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 function makeBackup(html) {
-  fs9.mkdirSync(BACKUP_DIR, { recursive: true });
-  const file = path8.join(BACKUP_DIR, `index.html.${(/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-")}.bak`);
-  fs9.writeFileSync(file, html, "utf8");
+  fs10.mkdirSync(BACKUP_DIR, { recursive: true });
+  const file = path9.join(BACKUP_DIR, `index.html.${(/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-")}.bak`);
+  fs10.writeFileSync(file, html, "utf8");
   return file;
 }
 function rewriteIndexModuleProxyTags(html) {
@@ -1828,7 +2036,7 @@ function installEarlyBridge(options = {}) {
   }
   let backup = null;
   if (!options.noBackup) backup = makeBackup(html);
-  fs9.writeFileSync(indexPath, finalHtml, "utf8");
+  fs10.writeFileSync(indexPath, finalHtml, "utf8");
   return { ok: true, changed: true, mode, backup, status: getEarlyBridgeStatus() };
 }
 function uninstallEarlyBridge(options = {}) {
@@ -1844,7 +2052,7 @@ function uninstallEarlyBridge(options = {}) {
   const nextHtml = restoreIndexModuleProxyTags(html.replace(markerRegex, "").replace(/\n{3,}/g, "\n\n"));
   let backup = null;
   if (!options.noBackup) backup = makeBackup(html);
-  fs9.writeFileSync(indexPath, nextHtml, "utf8");
+  fs10.writeFileSync(indexPath, nextHtml, "utf8");
   return { ok: true, changed: true, backup, status: getEarlyBridgeStatus() };
 }
 function makeFastRoutesLiteral() {
@@ -1853,8 +2061,8 @@ function makeFastRoutesLiteral() {
 function makeTemplatePreloadList() {
   const fallback = ["help.html", "hotkeys.html", "formatting.html", "welcome.html", "welcomePrompt.html", "assistantNote.html"];
   try {
-    const dir = path8.join(getServerRoot(), "public", "scripts", "templates");
-    const names = fs9.readdirSync(dir).filter((name) => name.endsWith(".html")).sort((a, b) => a.localeCompare(b));
+    const dir = path9.join(getServerRoot(), "public", "scripts", "templates");
+    const names = fs10.readdirSync(dir).filter((name) => name.endsWith(".html")).sort((a, b) => a.localeCompare(b));
     const list = names.length ? names : fallback;
     return list.map((name) => `/scripts/templates/${name}`);
   } catch {
@@ -1940,6 +2148,8 @@ ${fastRoutes}
   var characterProgressRowTimer = null;
   var recentProgressRenderTimer = null;
   var recentProgressRemoveTimer = null;
+  var recentChatsPatchBaselines = new Map();
+  var characterGetPatchBaselines = new Map();
 
   function cpNumber(value, fallback) {
     if (value === null || value === undefined || value === '') return fallback;
@@ -2022,6 +2232,8 @@ ${fastRoutes}
     var phase = String(data && data.phase || '');
     if (cache === 'ASYNC-MISS') return '\u540E\u7AEF\u6B63\u5728\u6784\u5EFA\u89D2\u8272\u7F13\u5B58\uFF0C\u9996\u6B21\u52A0\u8F7D\u53EF\u80FD\u8F83\u4E45\u2026';
     if (phase === 'requesting' || phase === 'starting') return '\u7B49\u5F85 SillyTavern \u539F\u59CB\u63A5\u53E3\u8FD4\u56DE\u89D2\u8272\u5217\u8868\u2026';
+    if (phase === 'scanning') return '\u6B63\u5728\u626B\u63CF\u89D2\u8272\u5361\u6587\u4EF6\u2026';
+    if (phase === 'reading') return '\u6B63\u5728\u8BFB\u53D6\u89D2\u8272\u5361\u5143\u6570\u636E\u5E76\u6784\u5EFA\u7F13\u5B58\u2026';
     if (phase === 'downloading') return '\u6B63\u5728\u4E0B\u8F7D\u89D2\u8272\u5217\u8868\u6570\u636E\u2026';
     if (phase === 'transforming') return '\u6B63\u5728\u6574\u7406\u89D2\u8272\u7F13\u5B58\u2026';
     if (phase === 'cached') return '\u7F13\u5B58\u5DF2\u5C31\u7EEA\uFF0C\u6B63\u5728\u5237\u65B0\u89D2\u8272\u5217\u8868\u2026';
@@ -2048,12 +2260,18 @@ ${fastRoutes}
       var parts = [];
       var received = Math.max(0, cpNumber(data.bytesReceived, 0) || 0);
       var total = cpNumber(data.totalBytes, null);
-      if (total && total > 0) parts.push('\u5DF2\u63A5\u6536 ' + cpFormatBytes(received) + ' / ' + cpFormatBytes(total));
-      else if (received > 0) parts.push('\u5DF2\u63A5\u6536 ' + cpFormatBytes(received));
+      var phase = String(data.phase || '');
+      var bytesLabel = (phase === 'reading' || phase === 'scanning') ? '\u5DF2\u8BFB\u53D6 ' : (phase === 'transforming' || phase === 'cached') ? '\u5DF2\u5904\u7406 ' : '\u5DF2\u63A5\u6536 ';
+      var speedLabel = (phase === 'reading' || phase === 'scanning') ? '\u8BFB\u53D6\u901F\u5EA6 ' : (phase === 'transforming' || phase === 'cached') ? '\u5904\u7406\u901F\u5EA6 ' : '';
+      if (total && total > 0) parts.push(bytesLabel + cpFormatBytes(received) + ' / ' + cpFormatBytes(total));
+      else if (received > 0) parts.push(bytesLabel + cpFormatBytes(received));
       if (determinate) parts.push(percent.toFixed(1) + '%');
-      if ((cpNumber(data.speedBps, 0) || 0) > 0) parts.push(cpFormatBytes(data.speedBps) + '/s');
+      if ((cpNumber(data.speedBps, 0) || 0) > 0) parts.push(speedLabel + cpFormatBytes(data.speedBps) + '/s');
       if (cpNumber(data.etaMs, null) !== null && (cpNumber(data.etaMs, 0) || 0) > 0) parts.push('\u5269\u4F59 ' + cpFormatDuration(data.etaMs));
       else if (data.startedAt) parts.push('\u5DF2\u7528 ' + cpFormatDuration(Date.now() - data.startedAt));
+      if (cpNumber(data.totalCount, null) !== null) parts.push('\u89D2\u8272 ' + (cpNumber(data.count, 0) || 0) + ' / ' + (cpNumber(data.totalCount, 0) || 0));
+      else if (cpNumber(data.count, null) !== null) parts.push('\u89D2\u8272 ' + (cpNumber(data.count, 0) || 0));
+      if ((cpNumber(data.errors, 0) || 0) > 0) parts.push('\u8DF3\u8FC7 ' + (cpNumber(data.errors, 0) || 0));
       if (data.cache) parts.push('\u7F13\u5B58\u72B6\u6001 ' + data.cache);
       if (data.phase) parts.push('\u9636\u6BB5 ' + data.phase);
       if (data.error) parts.push('\u9519\u8BEF ' + data.error);
@@ -2157,7 +2375,21 @@ ${fastRoutes}
   }
 
   function cpGetRecentChatList() {
-    try { return document.querySelector('#chat .welcomePanel .recentChatList') || document.querySelector('.welcomePanel .recentChatList'); } catch (_) { return null; }
+    try {
+      var lists = cpGetRecentChatLists();
+      for (var i = 0; i < lists.length; i++) {
+        if (lists[i] && lists[i].querySelector('#cocktail-plus-recent-load-progress')) return lists[i];
+      }
+      return document.querySelector('#chat .welcomePanel .recentChatList') || document.querySelector('.welcomePanel .recentChatList');
+    } catch (_) { return null; }
+  }
+
+  function cpGetRecentChatLists() {
+    try { return Array.prototype.slice.call(document.querySelectorAll('.welcomePanel .recentChatList')); } catch (_) { return []; }
+  }
+
+  function cpGetRecentProgressHost() {
+    try { return document.querySelector('#chat .welcomePanel .recentChatsTitle') || document.querySelector('.welcomePanel .recentChatsTitle') || cpGetRecentChatList(); } catch (_) { return null; }
   }
 
   function cpEnsureRecentProgressStyle() {
@@ -2166,14 +2398,14 @@ ${fastRoutes}
       var style = document.createElement('style');
       style.id = 'cocktail-plus-recent-load-style';
       style.textContent = [
-        '#cocktail-plus-recent-load-progress{box-sizing:border-box;width:100%;margin:4px 0 8px;padding:12px;border:1px solid rgba(120,220,255,.35);border-radius:10px;background:linear-gradient(180deg,rgba(28,43,58,.96),rgba(18,26,36,.96));box-shadow:0 8px 24px rgba(0,0,0,.16);color:#e9f8ff;font-size:13px;line-height:1.45;}',
-        '#cocktail-plus-recent-load-progress .cp-recent-progress-title{font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:8px;}',
-        '#cocktail-plus-recent-load-progress .cp-recent-progress-title:before{content:"";display:inline-block;width:8px;height:8px;border-radius:999px;background:#72e0ff;box-shadow:0 0 10px #72e0ff;}',
-        '#cocktail-plus-recent-load-progress .cp-recent-progress-message{opacity:.92;margin-bottom:8px;}',
-        '#cocktail-plus-recent-load-progress .cp-recent-progress-track{position:relative;overflow:hidden;height:8px;border-radius:999px;background:rgba(255,255,255,.12);}',
+        '#cocktail-plus-recent-load-progress{box-sizing:border-box;display:inline-flex;align-items:center;gap:6px;max-width:min(46vw,360px);margin-left:10px;padding:2px 7px;border:1px solid rgba(120,220,255,.38);border-radius:999px;background:rgba(18,34,46,.72);color:#e9f8ff;font-size:11px;font-weight:500;line-height:1.2;vertical-align:middle;white-space:nowrap;overflow:hidden;}',
+        '#cocktail-plus-recent-load-progress .cp-recent-progress-title{display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;font-weight:700;}',
+        '#cocktail-plus-recent-load-progress .cp-recent-progress-title:before{content:"";display:inline-block;width:6px;height:6px;border-radius:999px;background:#72e0ff;box-shadow:0 0 8px #72e0ff;}',
+        '#cocktail-plus-recent-load-progress .cp-recent-progress-message{display:none;}',
+        '#cocktail-plus-recent-load-progress .cp-recent-progress-track{position:relative;overflow:hidden;flex:0 0 44px;width:44px;height:4px;border-radius:999px;background:rgba(255,255,255,.16);}',
         '#cocktail-plus-recent-load-progress .cp-recent-progress-bar{height:100%;width:0%;border-radius:999px;background:linear-gradient(90deg,#6ee7ff,#8fffb8);transition:width .18s ease;}',
         '#cocktail-plus-recent-load-progress.cp-indeterminate .cp-recent-progress-bar{width:38%;animation:cpRecentIndeterminate 1.2s ease-in-out infinite;}',
-        '#cocktail-plus-recent-load-progress .cp-recent-progress-meta{margin-top:8px;display:flex;flex-wrap:wrap;gap:8px 12px;opacity:.78;font-size:12px;}',
+        '#cocktail-plus-recent-load-progress .cp-recent-progress-meta{min-width:0;overflow:hidden;text-overflow:ellipsis;opacity:.82;font-size:11px;font-weight:400;}',
         '.welcomePanel .recentChatList.cp-recent-loading .noRecentChat{display:none!important;}',
         '@keyframes cpRecentIndeterminate{0%{transform:translateX(-110%)}50%{transform:translateX(60%)}100%{transform:translateX(260%)}}'
       ].join('');
@@ -2182,19 +2414,21 @@ ${fastRoutes}
   }
 
   function cpEnsureRecentProgressElement() {
-    var list = cpGetRecentChatList();
-    if (!list) return null;
+    var host = cpGetRecentProgressHost();
+    if (!host) return null;
     cpEnsureRecentProgressStyle();
-    list.classList.add('cp-recent-loading');
+    cpGetRecentChatLists().forEach(function (list) {
+      try { list.classList.add('cp-recent-loading'); } catch (_) {}
+    });
     var el = document.getElementById('cocktail-plus-recent-load-progress');
     if (!el) {
       el = document.createElement('div');
       el.id = 'cocktail-plus-recent-load-progress';
       el.setAttribute('role', 'status');
       el.setAttribute('aria-live', 'polite');
-      el.innerHTML = '<div class="cp-recent-progress-title">\u9E21\u5C3E\u9152+ \u6B63\u5728\u52A0\u8F7D\u6700\u8FD1\u6D88\u606F</div><div class="cp-recent-progress-message"></div><div class="cp-recent-progress-track"><div class="cp-recent-progress-bar"></div></div><div class="cp-recent-progress-meta"></div>';
+      el.innerHTML = '<span class="cp-recent-progress-title">\u52A0\u8F7D\u6700\u8FD1</span><span class="cp-recent-progress-message"></span><span class="cp-recent-progress-track"><span class="cp-recent-progress-bar"></span></span><span class="cp-recent-progress-meta"></span>';
     }
-    if (el.parentNode !== list) list.insertBefore(el, list.firstChild || null);
+    if (el.parentNode !== host) host.appendChild(el);
     return el;
   }
 
@@ -2210,10 +2444,40 @@ ${fastRoutes}
     return '\u6B63\u5728\u52A0\u8F7D\u6700\u8FD1\u6D88\u606F\u2026';
   }
 
+  function cpRecentListHasRenderedContent(expectedItems) {
+    try {
+      var lists = cpGetRecentChatLists();
+      var expected = cpNumber(expectedItems, null);
+      for (var i = 0; i < lists.length; i++) {
+        var list = lists[i];
+        if (!list) continue;
+        if (expected === 0 && list.querySelector('.noRecentChat')) return true;
+        if (expected === null && list.querySelector('.recentChat,[data-file],.noRecentChat')) return true;
+        if ((expected === null || expected > 0) && list.querySelector('.recentChat,[data-file]')) return true;
+        if (expected > 0) {
+          var children = Array.prototype.slice.call(list.children || []);
+          for (var j = 0; j < children.length; j++) {
+            var child = children[j];
+            if (!child) continue;
+            if (child.id === 'cocktail-plus-recent-load-progress') continue;
+            if (child.classList && child.classList.contains('noRecentChat')) continue;
+            if (child.classList && child.classList.contains('showMoreChats')) continue;
+            return true;
+          }
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
   function cpRenderRecentProgress() {
     try {
       var data = state.recentChatsLoad || {};
       if (!data.active) return;
+      if (String(data.phase || '') === 'rendering' && cpRecentListHasRenderedContent(data.expectedItems)) {
+        cpRemoveRecentProgress();
+        return;
+      }
       var el = cpEnsureRecentProgressElement();
       if (!el) return;
       var percent = cpClampPercent(data.percent);
@@ -2283,10 +2547,12 @@ ${fastRoutes}
     try {
       if (recentProgressRemoveTimer) { clearTimeout(recentProgressRemoveTimer); recentProgressRemoveTimer = null; }
       state.recentChatsLoad.active = false;
-      var list = cpGetRecentChatList();
-      if (list) list.classList.remove('cp-recent-loading');
-      var el = document.getElementById('cocktail-plus-recent-load-progress');
-      if (el && el.parentNode) el.parentNode.removeChild(el);
+      cpGetRecentChatLists().forEach(function (list) {
+        try { list.classList.remove('cp-recent-loading'); } catch (_) {}
+      });
+      Array.prototype.slice.call(document.querySelectorAll('#cocktail-plus-recent-load-progress')).forEach(function (el) {
+        try { if (el && el.parentNode) el.parentNode.removeChild(el); } catch (_) {}
+      });
     } catch (_) {}
   }
 
@@ -2360,12 +2626,40 @@ ${fastRoutes}
     }
   }
 
+  function cpShouldInvalidateSettingsGet(pathname) {
+    return pathname === '/api/worldinfo/import'
+      || pathname === '/api/worldinfo/delete'
+      || pathname === '/api/worldinfo/edit'
+      || pathname === SETTINGS_SAVE.originalSavePath;
+  }
+
+  async function cpInvalidateSettingsGet(rawFetch, input, init, reason) {
+    try {
+      settingsGetPrefetch = null;
+      var headers = cloneHeaders(input, init);
+      headers.set('content-type', 'application/json');
+      await rawFetch(PREFIX + '/cache/clear', {
+        method: 'POST',
+        headers: headers,
+        credentials: (init && init.credentials) || 'same-origin',
+        cache: 'no-store',
+        redirect: 'manual',
+        body: JSON.stringify({ endpoints: [] })
+      });
+      remember('settings.get.invalidate', { reason: reason || '' });
+    } catch (error) {
+      remember('settings.get.invalidate-error', { reason: reason || '', error: String(error && error.message || error) });
+    }
+  }
+
   async function cpFetchWithInvalidation(rawFetch, input, init, url, method) {
     var endpoints = url && url.origin === location.origin && method === 'POST' ? cpEndpointsToInvalidate(url.pathname) : [];
-    if (!endpoints.length) return rawFetch(input, init);
+    var invalidateSettingsGet = url && url.origin === location.origin && method === 'POST' && cpShouldInvalidateSettingsGet(url.pathname);
+    if (!endpoints.length && !invalidateSettingsGet) return rawFetch(input, init);
     var response = await rawFetch(input, init);
     if (response && response.ok) {
-      await cpNotifyInvalidate(rawFetch, input, init, endpoints, url.pathname);
+      if (endpoints.length) await cpNotifyInvalidate(rawFetch, input, init, endpoints, url.pathname);
+      if (invalidateSettingsGet) await cpInvalidateSettingsGet(rawFetch, input, init, url.pathname);
     }
     return response;
   }
@@ -2784,6 +3078,38 @@ ${fastRoutes}
 
   function sameJson(a, b) {
     return stableStringify(a) === stableStringify(b);
+  }
+
+  // SillyTavern refreshes characters[chid].json_data after /characters/get, but an already-open
+  // editor keeps its hidden json_data input. Keep that input aligned so edit patches use a fresh base.
+  function cpSyncCharacterEditorJsonData(avatar, jsonData) {
+    var expectedAvatar = String(avatar || '');
+    var text = String(jsonData || '');
+    if (!expectedAvatar || !text) return false;
+    var hidden = null;
+    var avatarPole = null;
+    try { hidden = document.querySelector('#character_json_data'); } catch (_) {}
+    try { avatarPole = document.querySelector('#avatar_url_pole'); } catch (_) {}
+    if (!hidden || !avatarPole) return false;
+    if (String(avatarPole.value || '') !== expectedAvatar) return false;
+    if (hidden.value !== text) hidden.value = text;
+    return true;
+  }
+
+  function cpScheduleCharacterEditorJsonSync(avatar, jsonData) {
+    var expectedAvatar = String(avatar || '');
+    var text = String(jsonData || '');
+    if (!expectedAvatar || !text) return;
+    var startedAt = Date.now();
+    var attempts = 0;
+    var attempt = function () {
+      attempts += 1;
+      if (cpSyncCharacterEditorJsonData(expectedAvatar, text)) return;
+      if (attempts < 20 && Date.now() - startedAt < 2000) {
+        try { setTimeout(attempt, 100); } catch (_) {}
+      }
+    };
+    attempt();
   }
 
   function decodeBodyToText(body) {
@@ -3550,6 +3876,7 @@ ${fastRoutes}
           state.settingsSave.optimized += 1;
           state.settingsSave.savedBytes += patch.savedBytes || 0;
           await updateSettingsBaseline(nextObject, 'settings-save-' + patch.mode);
+          await cpInvalidateSettingsGet(rawFetch, input, init, url.pathname);
           remember('settings.save.optimized', { mode: patch.mode, status: fastResponse.status, savedBytes: patch.savedBytes || 0, durationMs: Date.now() - startedAt });
           return fastResponse;
         }
@@ -3561,7 +3888,10 @@ ${fastRoutes}
 
     var fallbackResponse = await rawFetch(input, init);
     state.settingsSave.fallbacks += 1;
-    if (fallbackResponse && fallbackResponse.ok) await updateSettingsBaseline(nextObject, patch ? 'settings-save-fallback' : 'settings-save-original');
+    if (fallbackResponse && fallbackResponse.ok) {
+      await updateSettingsBaseline(nextObject, patch ? 'settings-save-fallback' : 'settings-save-original');
+      await cpInvalidateSettingsGet(rawFetch, input, init, url.pathname);
+    }
     remember('settings.save.original', { status: fallbackResponse && fallbackResponse.status, optimized: false, durationMs: Date.now() - startedAt });
     return fallbackResponse;
   }
@@ -3596,15 +3926,294 @@ ${fastRoutes}
       }
       var finalTotal = totalBytes || bytesReceived;
       cpUpdateRecentProgress(cpRecentTransferPatch('rendering', startedAt, bytesReceived, finalTotal, { status: response.status, percent: finalTotal ? 100 : null, etaMs: 0, message: '\u6B63\u5728\u89E3\u6790\u5E76\u6E32\u67D3\u6700\u8FD1\u6D88\u606F\u2026' }));
-      return { body: new Blob(chunks), bytesReceived: bytesReceived, totalBytes: finalTotal || null };
+      var responseText = await new Response(new Blob(chunks)).text();
+      return { body: responseText, text: responseText, bytesReceived: bytesReceived, totalBytes: finalTotal || null };
     }
 
     var text = await response.text();
     bytesReceived = utf8Bytes(text || '');
     var fallbackTotal = totalBytes || bytesReceived;
     cpUpdateRecentProgress(cpRecentTransferPatch('rendering', startedAt, bytesReceived, fallbackTotal, { status: response.status, percent: fallbackTotal ? 100 : null, etaMs: 0, message: '\u6B63\u5728\u89E3\u6790\u5E76\u6E32\u67D3\u6700\u8FD1\u6D88\u606F\u2026' }));
-    return { body: text, bytesReceived: bytesReceived, totalBytes: fallbackTotal || null };
+    return { body: text, text: text, bytesReceived: bytesReceived, totalBytes: fallbackTotal || null };
   }
+
+
+  function cpRecentPatchKey(bodyObject) {
+    try {
+      var clean = Object.assign({}, bodyObject || {});
+      delete clean.cpRecentPatch;
+      return stableStringify(clean);
+    } catch (_) {
+      return '{}';
+    }
+  }
+
+  function cpApplyRecentPatch(baseData, ops) {
+    var next = Array.isArray(baseData) ? baseData.slice() : [];
+    if (!Array.isArray(ops)) return next;
+    ops.forEach(function (op) {
+      if (!op || typeof op !== 'object') return;
+      if (op.op === 'set') {
+        var index = Number(op.index);
+        if (Number.isInteger(index) && index >= 0) next[index] = op.value;
+      } else if (op.op === 'splice') {
+        var spliceIndex = Math.max(0, Number(op.index) || 0);
+        var deleteCount = Math.max(0, Number(op.deleteCount) || 0);
+        var items = Array.isArray(op.items) ? op.items : [];
+        next.splice.apply(next, [spliceIndex, deleteCount].concat(items));
+      }
+    });
+    return next;
+  }
+
+  function cpRememberRecentBaseline(key, hash, data) {
+    if (!key || !hash || !Array.isArray(data)) return;
+    recentChatsPatchBaselines.set(key, { hash: hash, data: data });
+  }
+
+  function cpResolveRecentPatchedData(key, response, text) {
+    var mode = response.headers.get(HEADER_PREFIX + '-recent-patch') || 'full';
+    var hash = response.headers.get(HEADER_PREFIX + '-recent-hash') || '';
+    var baseline = recentChatsPatchBaselines.get(key);
+    var data = [];
+    if (mode === 'noop' && baseline && Array.isArray(baseline.data)) {
+      data = baseline.data;
+    } else if (mode === 'patch' && baseline && Array.isArray(baseline.data)) {
+      var patch = JSON.parse(text || '{}');
+      data = cpApplyRecentPatch(baseline.data, patch.ops);
+      hash = patch.nextHash || hash;
+    } else {
+      var parsed = JSON.parse(text || '[]');
+      data = Array.isArray(parsed) ? parsed : [];
+
+    }
+    if (hash) cpRememberRecentBaseline(key, hash, data);
+    return data;
+  }
+
+
+
+  function cpCharacterGetKey(bodyObject) {
+    try {
+      return String((bodyObject || {}).avatar_url || '');
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function cpSetAtPath(target, path, value) {
+    if (!Array.isArray(path) || path.length === 0) return value;
+    var parent = target;
+    for (var i = 0; i < path.length - 1; i++) {
+      var key = path[i];
+      var nextKey = path[i + 1];
+      if (parent[key] === null || typeof parent[key] !== 'object') parent[key] = typeof nextKey === 'number' ? [] : {};
+      parent = parent[key];
+    }
+    parent[path[path.length - 1]] = value;
+    return target;
+  }
+
+  function cpDeleteAtPath(target, path) {
+    if (!Array.isArray(path) || path.length === 0) return target;
+    var parent = target;
+    for (var i = 0; i < path.length - 1; i++) {
+      if (!parent || typeof parent !== 'object') return target;
+      parent = parent[path[i]];
+    }
+    if (parent && typeof parent === 'object') delete parent[path[path.length - 1]];
+    return target;
+  }
+
+  function cpApplyCharacterPatch(baseData, ops) {
+    var next = JSON.parse(JSON.stringify(baseData || {}));
+    if (!Array.isArray(ops)) return next;
+    ops.forEach(function (op) {
+      if (!op || typeof op !== 'object') return;
+      if (op.op === 'set') next = cpSetAtPath(next, op.path, op.value);
+      else if (op.op === 'delete') next = cpDeleteAtPath(next, op.path);
+    });
+    return next;
+  }
+
+  function cpRememberCharacterGetBaseline(key, hash, data) {
+    if (!key || !hash || !data || typeof data !== 'object') return;
+    characterGetPatchBaselines.set(key, { hash: hash, data: data });
+  }
+
+  function cpResolveCharacterGetPatchedData(key, response, text) {
+    var mode = response.headers.get(HEADER_PREFIX + '-character-get-patch') || 'full';
+    var hash = response.headers.get(HEADER_PREFIX + '-character-get-hash') || '';
+    var baseline = characterGetPatchBaselines.get(key);
+    var data;
+    if (mode === 'noop' && baseline && baseline.data) {
+      data = baseline.data;
+    } else if (mode === 'dedup') {
+      var dedup = JSON.parse(text || '{}');
+      var jsonData = String(dedup.json_data || '');
+      data = JSON.parse(jsonData || '{}');
+      if (data && typeof data === 'object') delete data.json_data;
+      data = cpApplyCharacterPatch(data, dedup.ops);
+      data.json_data = jsonData;
+      hash = dedup.hash || hash;
+    } else if (mode === 'patch' && baseline && baseline.data) {
+      var patch = JSON.parse(text || '{}');
+      data = cpApplyCharacterPatch(baseline.data, patch.ops);
+      hash = patch.nextHash || hash;
+    } else {
+      data = JSON.parse(text || '{}');
+    }
+    if (hash) cpRememberCharacterGetBaseline(key, hash, data);
+    return data;
+  }
+
+  async function handleCharacterGetFetch(rawFetch, input, init, url, method) {
+    if (!rawFetch || !url || method !== 'POST') return null;
+    try {
+      var probeText = await getBodyText(input, init, method);
+      var probeBody = {};
+      try { probeBody = probeText ? JSON.parse(probeText) : {}; } catch (_) { probeBody = {}; }
+      var headers = cloneHeaders(input, init);
+      if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+      var bodyText = probeText;
+      var bodyObject = probeBody;
+      var key = cpCharacterGetKey(bodyObject);
+      var baseline = key ? characterGetPatchBaselines.get(key) : null;
+      if (baseline && baseline.hash) bodyObject.cpCharacterGetPatch = { hash: baseline.hash };
+      var response = await rawFetch(PREFIX + '/fast/characters-get', { method: 'POST', headers: headers, credentials: (init && init.credentials) || 'same-origin', cache: 'no-store', redirect: 'manual', body: JSON.stringify(bodyObject || {}) });
+      if (!response || !response.ok || response.headers.get(HEADER_PREFIX + '-character-get-ready') !== '1') return response;
+      var text = await response.text();
+      var data = cpResolveCharacterGetPatchedData(key, response, text);
+      cpScheduleCharacterEditorJsonSync(key, data && data.json_data);
+      var responseHeaders = cpHeadersFromResponse(response);
+      try { responseHeaders.delete('content-length'); } catch (_) {}
+      remember('character.get.fast-response', { avatar: key, mode: response.headers.get(HEADER_PREFIX + '-character-get-patch') || 'full', status: response.status });
+      return new Response(JSON.stringify(data), { status: response.status, statusText: response.statusText || 'OK', headers: responseHeaders });
+    } catch (error) {
+      remember('character.get.fast-error', { error: String(error && error.message || error) });
+      return null;
+    }
+  }
+
+  function cpFormDataToPlainObject(formData) {
+    var out = {};
+    try {
+      formData.forEach(function (value, key) {
+        if (value instanceof File) {
+          if (value && value.size > 0 && value.name) out[key] = value;
+          return;
+        }
+        if (Object.prototype.hasOwnProperty.call(out, key)) {
+          if (!Array.isArray(out[key])) out[key] = [out[key]];
+          out[key].push(String(value));
+        } else {
+          out[key] = String(value);
+        }
+      });
+    } catch (_) {}
+    return out;
+  }
+
+  function cpTagsString(value) {
+    if (Array.isArray(value)) return value.join(', ');
+    return typeof value === 'string' ? value : '';
+  }
+
+  function cpCharacterEditBaseFields(raw, meta) {
+    raw = raw || {};
+    meta = meta || {};
+    var data = raw.data && typeof raw.data === 'object' ? raw.data : {};
+    var extensions = data.extensions && typeof data.extensions === 'object' ? data.extensions : {};
+    var depth = extensions.depth_prompt && typeof extensions.depth_prompt === 'object' ? extensions.depth_prompt : {};
+    return {
+      avatar_url: meta.avatar_url || raw.avatar || '',
+      ch_name: data.name ?? raw.name ?? '',
+      description: data.description ?? raw.description ?? '',
+      personality: data.personality ?? raw.personality ?? '',
+      scenario: data.scenario ?? raw.scenario ?? '',
+      first_mes: data.first_mes ?? raw.first_mes ?? '',
+      mes_example: data.mes_example ?? raw.mes_example ?? '',
+      creator_notes: data.creator_notes ?? raw.creatorcomment ?? '',
+      system_prompt: data.system_prompt ?? '',
+      post_history_instructions: data.post_history_instructions ?? '',
+      tags: cpTagsString(data.tags ?? raw.tags),
+      creator: data.creator ?? raw.creator ?? '',
+      character_version: data.character_version ?? raw.character_version ?? '',
+      alternate_greetings: Array.isArray(data.alternate_greetings) ? data.alternate_greetings.slice() : [],
+      talkativeness: String(extensions.talkativeness ?? raw.talkativeness ?? 0.5),
+      fav: String(Boolean(extensions.fav ?? raw.fav)),
+      world: extensions.world ?? '',
+      depth_prompt_prompt: depth.prompt ?? raw.depth_prompt_prompt ?? '',
+      depth_prompt_depth: String(depth.depth ?? raw.depth_prompt_depth ?? 4),
+      depth_prompt_role: depth.role ?? raw.depth_prompt_role ?? 'system',
+      chat: meta.chat ?? raw.chat ?? '',
+      create_date: meta.create_date ?? raw.create_date ?? '',
+      extensions: meta.extensions ?? '',
+    };
+  }
+
+  function cpMakeStringPatch(base, next) {
+    base = String(base ?? '');
+    next = String(next ?? '');
+    if (base === next) return null;
+    var prefix = 0;
+    var min = Math.min(base.length, next.length);
+    while (prefix < min && base[prefix] === next[prefix]) prefix++;
+    var suffix = 0;
+    while (suffix < min - prefix && base[base.length - 1 - suffix] === next[next.length - 1 - suffix]) suffix++;
+    var patch = { type: 'splice', start: prefix, deleteCount: base.length - prefix - suffix, insert: next.slice(prefix, next.length - suffix) };
+    var patchText = JSON.stringify(patch);
+    return patchText.length < next.length ? patch : { type: 'set', value: next };
+  }
+
+  async function handleCharacterEditFetch(rawFetch, input, init, url, method) {
+    if (!rawFetch || !url || method !== 'POST') return null;
+    try {
+      var formData = init && init.body instanceof FormData ? init.body : null;
+      if (!formData && input instanceof Request) {
+        try { formData = await input.clone().formData(); } catch (_) {}
+      }
+      if (!formData) return null;
+      var plain = cpFormDataToPlainObject(formData);
+      if (plain.avatar instanceof File) return null;
+      var rawJson = String(plain.json_data || '');
+      if (!rawJson || !plain.avatar_url) return null;
+      var raw = JSON.parse(rawJson);
+      var baseHash = await sha256Hex(rawJson);
+      var baseFields = cpCharacterEditBaseFields(raw, plain);
+      var payload = { avatar_url: String(plain.avatar_url), baseHash: baseHash, fields: {}, patches: {}, meta: { avatar_url: String(plain.avatar_url), chat: plain.chat || '', create_date: plain.create_date || '', extensions: plain.extensions || '' } };
+      Object.keys(plain).forEach(function (key) {
+        if (key === 'json_data' || key === 'avatar') return;
+        var nextValue = plain[key];
+        var baseValue = baseFields[key];
+        if (Array.isArray(nextValue) || Array.isArray(baseValue)) {
+          if (!sameJson(nextValue, baseValue)) payload.fields[key] = nextValue;
+          return;
+        }
+        if (String(nextValue ?? '') === String(baseValue ?? '')) return;
+        if (typeof nextValue === 'string' && typeof baseValue === 'string') payload.patches[key] = cpMakeStringPatch(baseValue, nextValue);
+        else payload.fields[key] = nextValue;
+      });
+      var headers = cloneHeaders(input, init);
+      headers.set('content-type', 'application/json');
+      headers.delete && headers.delete('content-encoding');
+      var fastResponse = await rawFetch(PREFIX + '/fast/characters-edit', { method: 'POST', headers: headers, credentials: (init && init.credentials) || 'same-origin', cache: 'no-store', redirect: 'manual', body: JSON.stringify(payload) });
+      if (fastResponse && fastResponse.ok) {
+        remember('character.edit.optimized', { avatar: plain.avatar_url, fields: Object.keys(payload.fields).length, patches: Object.keys(payload.patches).length });
+        characterGetPatchBaselines.delete(String(plain.avatar_url));
+        return fastResponse;
+      }
+      if (fastResponse && fastResponse.status === 409) remember('character.edit.stale-fallback', { avatar: plain.avatar_url });
+      return fastResponse;
+    } catch (error) {
+      remember('character.edit.fast-error', { error: String(error && error.message || error) });
+      return new Response(JSON.stringify({ ok: false, error: String(error && error.message || error) }), { status: 500, headers: { 'content-type': 'application/json' } });
+    }
+  }
+
+
+
+
 
   async function handleRecentChatsFetch(rawFetch, input, init, url, method) {
     if (!rawFetch || !url || method !== 'POST') return null;
@@ -3612,10 +4221,35 @@ ${fastRoutes}
     cpUpdateRecentProgress({ active: true, phase: 'requesting', startedAt: startedAt, bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, status: null, error: null, message: '\u7B49\u5F85 /recent \u8FD4\u56DE\u6700\u8FD1\u6D88\u606F\u2026' });
     remember('recent.fetch.start', { path: url.pathname });
     try {
-      var response = await rawFetch(input, init);
+      var headers = cloneHeaders(input, init);
+      if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+      var bodyText = await getBodyText(input, init, method);
+      var bodyObject = {};
+      try { bodyObject = bodyText ? JSON.parse(bodyText) : {}; } catch (_) { bodyObject = {}; }
+      var patchKey = cpRecentPatchKey(bodyObject);
+      var baseline = recentChatsPatchBaselines.get(patchKey);
+      if (baseline && baseline.hash) bodyObject.cpRecentPatch = { hash: baseline.hash };
+      var fastInit = {
+        method: 'POST',
+        headers: headers,
+        credentials: (init && init.credentials) || 'same-origin',
+        cache: 'no-store',
+        redirect: 'manual'
+      };
+      fastInit.body = JSON.stringify(bodyObject || {});
+      var response = await rawFetch(PREFIX + '/fast/recent-chats', fastInit);
       var read = await cpReadRecentResponseWithProgress(response, startedAt);
-      remember('recent.fetch.response', { path: url.pathname, status: response.status, bytesReceived: read.bytesReceived, totalBytes: read.totalBytes, durationMs: Date.now() - startedAt });
-      return new Response(read.body, { status: response.status, statusText: response.statusText || 'OK', headers: cpHeadersFromResponse(response) });
+      var recentData = cpResolveRecentPatchedData(patchKey, response, read.text);
+      var responseBody = JSON.stringify(recentData);
+      var expectedItems = null;
+      try {
+        if (Array.isArray(recentData)) expectedItems = recentData.length;
+      } catch (_) {}
+      cpUpdateRecentProgress({ phase: 'rendering', expectedItems: expectedItems, status: response.status, percent: read.totalBytes ? 100 : null, etaMs: 0, message: '\u6B63\u5728\u89E3\u6790\u5E76\u6E32\u67D3\u6700\u8FD1\u6D88\u606F\u2026' });
+      remember('recent.fetch.response', { path: url.pathname, status: response.status, mode: response.headers.get(HEADER_PREFIX + '-recent-patch') || 'full', bytesReceived: read.bytesReceived, totalBytes: read.totalBytes, durationMs: Date.now() - startedAt });
+      var responseHeaders = cpHeadersFromResponse(response);
+      try { responseHeaders.delete('content-length'); } catch (_) {}
+      return new Response(responseBody, { status: response.status, statusText: response.statusText || 'OK', headers: responseHeaders });
     } catch (error) {
       cpFailRecentChatsProgress(error);
       remember('recent.fetch.error', { path: url.pathname, error: String(error && error.message || error), durationMs: Date.now() - startedAt });
@@ -3695,6 +4329,14 @@ ${fastRoutes}
       if (url && url.origin === location.origin && url.pathname === SETTINGS_GET.originalPath && method === SETTINGS_GET.method) {
         var settingsGetResponse = await handleSettingsGetFetch(rawFetch, input, init, url, method);
         if (settingsGetResponse) return settingsGetResponse;
+      }
+      if (url && url.origin === location.origin && url.pathname === '/api/characters/get' && method === 'POST') {
+        var characterGetResponse = await handleCharacterGetFetch(rawFetch, input, init, url, method);
+        if (characterGetResponse) return characterGetResponse;
+      }
+      if (url && url.origin === location.origin && url.pathname === '/api/characters/edit' && method === 'POST') {
+        var characterEditResponse = await handleCharacterEditFetch(rawFetch, input, init, url, method);
+        if (characterEditResponse) return characterEditResponse;
       }
       if (url && url.origin === location.origin && (url.pathname === CHAT_SAVE.originalGetPath || url.pathname === CHAT_SAVE.originalGroupGetPath) && method === CHAT_SAVE.method) {
         var chatGetResponse = await handleChatGetFetch(rawFetch, input, init, url, method);
@@ -3795,8 +4437,8 @@ function autoEnsureEarlyBridge() {
 }
 
 // server-plugins/cocktail-plus/src/routes.ts
-import fs13 from "node:fs";
-import path12 from "node:path";
+import fs17 from "node:fs";
+import path16 from "node:path";
 
 // server-plugins/cocktail-plus/src/fast-handler.ts
 function makeEntryFromBody(ctx, endpointKey, status, statusText, headers, bodyText, signature, durationMs, transform = null) {
@@ -3818,11 +4460,15 @@ async function refreshEntry(ctx, endpointKey, reason = "refresh") {
     stats.refreshes++;
     updateProgress({ phase: "starting", reason, startedAt, bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, status: null, error: null });
     const signature = endpoint.getSignature(ctx);
-    const result = await fetchOriginal(ctx, endpoint, { onProgress: updateProgress });
+    let result = null;
+    if (typeof endpoint.fetchForCache === "function") {
+      result = await endpoint.fetchForCache(ctx, config, { onProgress: updateProgress, startedAt, reason });
+    }
+    if (!result) result = await fetchOriginal(ctx, endpoint, { onProgress: updateProgress });
     if (result.ok && result.status >= 200 && result.status < 300) {
       const now = Date.now();
       updateProgress({ phase: "transforming", status: result.status, bytesReceived: result.bytesReceived ?? Buffer.byteLength(result.bodyText || "", "utf8"), totalBytes: result.totalBytes ?? null, etaMs: 0 });
-      const transformed = endpoint.transformBodyForCache ? endpoint.transformBodyForCache(ctx, result.bodyText, config) : defaultTransformBodyForCache(result.bodyText);
+      const transformed = result.transform ? { bodyText: result.bodyText, ...result.transform } : endpoint.transformBodyForCache ? endpoint.transformBodyForCache(ctx, result.bodyText, config) : defaultTransformBodyForCache(result.bodyText);
       const entry = {
         endpointKey,
         status: result.status,
@@ -3838,7 +4484,9 @@ async function refreshEntry(ctx, endpointKey, reason = "refresh") {
           sourceBytes: transformed.sourceBytes,
           cachedBytes: transformed.cachedBytes,
           count: transformed.count,
-          error: transformed.error
+          error: transformed.error,
+          direct: transformed.direct,
+          errors: transformed.errors
         },
         hitCount: 0,
         staleHitCount: 0,
@@ -3933,12 +4581,13 @@ async function handleFast(req, res, endpointKey) {
       memoryCache.set(cacheKey, entry);
       return sendEntry(res, entry, "HIT");
     }
-    if (config.staleWhileRevalidate && signatureMatches) {
+    if (config.staleWhileRevalidate && (signatureMatches || endpoint.staleOnSignatureChange)) {
       stats.staleHits++;
       entry.staleHitCount = Number(entry.staleHitCount || 0) + 1;
       memoryCache.set(cacheKey, entry);
-      const state = "STALE";
-      void refreshEntry(ctx, endpointKey, "max-stale-expired").catch(() => {
+      const state = signatureMatches ? "STALE" : "STALE-SIGNATURE";
+      const reason = signatureMatches ? "max-stale-expired" : "signature-changed";
+      void refreshEntry(ctx, endpointKey, reason).catch(() => {
       });
       return sendEntry(res, entry, state);
     }
@@ -3987,16 +4636,16 @@ async function handleFast(req, res, endpointKey) {
 }
 
 // server-plugins/cocktail-plus/src/service-worker.ts
-import fs10 from "node:fs";
-import path9 from "node:path";
+import fs11 from "node:fs";
+import path10 from "node:path";
 function makeFastRoutesLiteral2() {
   return ENDPOINT_LIST.map((endpoint) => `  [${JSON.stringify(endpoint.originalPath)}, { path: PREFIX + ${JSON.stringify(endpoint.fastPath)}, method: ${JSON.stringify(endpoint.method)} }]`).join(",\n");
 }
 function makeTemplatePreloadList2() {
   const fallback = ["help.html", "hotkeys.html", "formatting.html", "welcome.html", "welcomePrompt.html", "assistantNote.html"];
   try {
-    const dir = path9.join(getServerRoot(), "public", "scripts", "templates");
-    const names = fs10.readdirSync(dir).filter((name) => name.endsWith(".html")).sort((a, b) => a.localeCompare(b));
+    const dir = path10.join(getServerRoot(), "public", "scripts", "templates");
+    const names = fs11.readdirSync(dir).filter((name) => name.endsWith(".html")).sort((a, b) => a.localeCompare(b));
     const list = names.length ? names : fallback;
     return list.map((name) => `/scripts/templates/${name}`);
   } catch {
@@ -4383,10 +5032,10 @@ async function fetchFast(event, fastPath) {
         status: response.status,
         progress: originalPath === '/api/characters/all' ? {
           cache: cacheState,
-          phase: cacheState === 'ASYNC-MISS' ? 'requesting' : 'downloading',
+          phase: (cacheState === 'ASYNC-MISS' || cacheState === 'STALE-SIGNATURE') ? 'requesting' : 'downloading',
           status: response.status,
         } : null,
-        shouldPollStatus: originalPath === '/api/characters/all' && cacheState === 'ASYNC-MISS',
+        shouldPollStatus: originalPath === '/api/characters/all' && (cacheState === 'ASYNC-MISS' || cacheState === 'STALE-SIGNATURE'),
         durationMs: Date.now() - startedAt,
       });
       return response;
@@ -4640,13 +5289,753 @@ self.addEventListener('fetch', (event) => {
 `;
 }
 
+// server-plugins/cocktail-plus/src/endpoints/characters-edit.ts
+import fs12 from "node:fs";
+import path11 from "node:path";
+var JSON_CONTENT_TYPE3 = "application/json; charset=utf-8";
+var characterEditEndpoint = {
+  key: "character-edit",
+  aliases: ["character-edit", "/api/characters/edit"],
+  originalPath: "/api/characters/edit",
+  fastPath: "/fast/characters-edit",
+  configKey: "cacheCharactersAll",
+  method: "POST"
+};
+function extractPngTextChunks2(buffer) {
+  const chunks = [];
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return chunks;
+  let offset = 8;
+  while (offset + 12 <= buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.toString("ascii", offset + 4, offset + 8);
+    const dataStart = offset + 8;
+    const dataEnd = dataStart + length;
+    const nextOffset = dataEnd + 4;
+    if (dataEnd > buffer.length || nextOffset > buffer.length) break;
+    if (type === "tEXt") {
+      const separator = buffer.indexOf(0, dataStart);
+      if (separator >= dataStart && separator < dataEnd) {
+        const keyword = buffer.toString("latin1", dataStart, separator).toLowerCase();
+        if (keyword === "chara" || keyword === "ccv3") chunks.push({ keyword, text: buffer.toString("latin1", separator + 1, dataEnd) });
+      }
+    }
+    if (type === "IEND") break;
+    offset = nextOffset;
+  }
+  return chunks;
+}
+async function readCharacterRawJson(directories, avatar) {
+  const filePath = path11.join(directories.characters, path11.basename(avatar));
+  const buffer = await fs12.promises.readFile(filePath);
+  const chunks = extractPngTextChunks2(buffer);
+  const selected = chunks.find((c) => c.keyword === "ccv3") || chunks.find((c) => c.keyword === "chara");
+  if (!selected) throw new Error("No character metadata found");
+  return Buffer.from(selected.text, "base64").toString("utf8");
+}
+function asTagsString(value) {
+  if (Array.isArray(value)) return value.join(", ");
+  return typeof value === "string" ? value : "";
+}
+function deriveEditFields(raw, meta = {}) {
+  const data = raw?.data && typeof raw.data === "object" ? raw.data : {};
+  const extensions = data.extensions && typeof data.extensions === "object" ? data.extensions : {};
+  const depth = extensions.depth_prompt && typeof extensions.depth_prompt === "object" ? extensions.depth_prompt : {};
+  return {
+    avatar_url: meta.avatar_url || raw?.avatar || "",
+    ch_name: data.name ?? raw?.name ?? "",
+    description: data.description ?? raw?.description ?? "",
+    personality: data.personality ?? raw?.personality ?? "",
+    scenario: data.scenario ?? raw?.scenario ?? "",
+    first_mes: data.first_mes ?? raw?.first_mes ?? "",
+    mes_example: data.mes_example ?? raw?.mes_example ?? "",
+    creator_notes: data.creator_notes ?? raw?.creatorcomment ?? "",
+    system_prompt: data.system_prompt ?? "",
+    post_history_instructions: data.post_history_instructions ?? "",
+    tags: asTagsString(data.tags ?? raw?.tags),
+    creator: data.creator ?? raw?.creator ?? "",
+    character_version: data.character_version ?? raw?.character_version ?? "",
+    alternate_greetings: Array.isArray(data.alternate_greetings) ? data.alternate_greetings.slice() : [],
+    talkativeness: String(extensions.talkativeness ?? raw?.talkativeness ?? 0.5),
+    fav: String(Boolean(extensions.fav ?? raw?.fav)),
+    world: extensions.world ?? "",
+    depth_prompt_prompt: depth.prompt ?? raw?.depth_prompt_prompt ?? "",
+    depth_prompt_depth: String(depth.depth ?? raw?.depth_prompt_depth ?? 4),
+    depth_prompt_role: depth.role ?? raw?.depth_prompt_role ?? "system",
+    chat: meta.chat ?? raw?.chat ?? "",
+    create_date: meta.create_date ?? raw?.create_date ?? "",
+    extensions: meta.extensions ?? ""
+  };
+}
+function applyStringPatch(base, patch) {
+  if (!patch || typeof patch !== "object") return base;
+  if (patch.type === "set") return String(patch.value ?? "");
+  if (patch.type === "splice") {
+    const start = Math.max(0, Number(patch.start) || 0);
+    const deleteCount = Math.max(0, Number(patch.deleteCount) || 0);
+    const insert = String(patch.insert ?? "");
+    const source = String(base ?? "");
+    return source.slice(0, start) + insert + source.slice(start + deleteCount);
+  }
+  return base;
+}
+function applyPayload(baseFields, payload) {
+  const out = { ...baseFields };
+  const fields = payload.fields && typeof payload.fields === "object" ? payload.fields : {};
+  for (const [key, value] of Object.entries(fields)) out[key] = value;
+  const patches = payload.patches && typeof payload.patches === "object" ? payload.patches : {};
+  for (const [key, patch] of Object.entries(patches)) out[key] = applyStringPatch(out[key], patch);
+  return out;
+}
+async function handleCharacterEditFast(req, res) {
+  try {
+    const body = req.body || {};
+    const avatar = String(body.avatar_url || "").trim();
+    if (!avatar) return res.sendStatus(400);
+    const rawJson = await readCharacterRawJson(req.user?.directories || {}, avatar);
+    const currentHash = sha256(rawJson);
+    if (body.baseHash && body.baseHash !== currentHash) {
+      res.setHeader(HEADER_PREFIX, "characters-edit-fast");
+      return res.status(409).type(JSON_CONTENT_TYPE3).send(JSON.stringify({ ok: false, stale: true }));
+    }
+    const raw = JSON.parse(rawJson || "{}");
+    const baseFields = deriveEditFields(raw, body.meta || { avatar_url: avatar });
+    const nextBody = applyPayload(baseFields, body);
+    nextBody.avatar_url = avatar;
+    nextBody.json_data = rawJson;
+    const ctx = makeRequestContext(req, { bodyOverride: nextBody });
+    const result = await fetchOriginal(ctx, characterEditEndpoint);
+    res.setHeader(HEADER_PREFIX, "characters-edit-fast");
+    res.setHeader(`${HEADER_PREFIX}-characters-edit-mode`, "patch");
+    res.setHeader("content-type", result.headers?.["content-type"] || "text/plain; charset=utf-8");
+    return res.status(result.status || 200).send(result.bodyText ?? "");
+  } catch (error) {
+    res.setHeader(HEADER_PREFIX, "characters-edit-fast");
+    res.setHeader("content-type", JSON_CONTENT_TYPE3);
+    return res.status(500).send(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+  }
+}
+
+// server-plugins/cocktail-plus/src/endpoints/characters-get.ts
+import fs13 from "node:fs";
+import path12 from "node:path";
+var JSON_CONTENT_TYPE4 = "application/json; charset=utf-8";
+var HISTORY_LIMIT = 3;
+var characterGetEndpoint = {
+  key: "character-get",
+  aliases: ["character-get", "/api/characters/get"],
+  originalPath: "/api/characters/get",
+  fastPath: "/fast/characters-get",
+  configKey: "cacheCharactersAll",
+  method: "POST"
+};
+var characterGetCache = /* @__PURE__ */ new Map();
+function getAvatar(req) {
+  return String(req.body?.avatar_url || "").trim();
+}
+function getCacheKey3(ctx, avatar) {
+  return `${ctx.userKey}:${avatar}`;
+}
+function getClientHash(req) {
+  const hash = req.body?.cpCharacterGetPatch?.hash;
+  return typeof hash === "string" && hash ? hash : "";
+}
+function getCharacterSignature(req, avatar) {
+  try {
+    const filePath = path12.join(req.user?.directories?.characters || "", path12.basename(avatar));
+    const stat = fs13.statSync(filePath);
+    return sha256(stableStringify({ avatar, size: stat.size, mtimeMs: Math.round(stat.mtimeMs) }));
+  } catch {
+    return "";
+  }
+}
+function rememberHistory(entry, hash, data) {
+  if (!entry || !hash || data === void 0) return;
+  entry.history = entry.history instanceof Map ? entry.history : /* @__PURE__ */ new Map();
+  entry.history.set(hash, data);
+  while (entry.history.size > HISTORY_LIMIT) {
+    const first = entry.history.keys().next().value;
+    entry.history.delete(first);
+  }
+}
+function sameJson(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+function cloneJson3(value) {
+  return value === void 0 ? void 0 : JSON.parse(JSON.stringify(value));
+}
+function buildPatchOps(base, next, patchPath = [], ops = []) {
+  if (ops.length > 2e3) return ops;
+  if (sameJson(base, next)) return ops;
+  const baseIsObj = base && typeof base === "object";
+  const nextIsObj = next && typeof next === "object";
+  if (baseIsObj && nextIsObj && !Array.isArray(base) && !Array.isArray(next)) {
+    const keys = /* @__PURE__ */ new Set([...Object.keys(base), ...Object.keys(next)]);
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(next, key)) {
+        ops.push({ op: "delete", path: patchPath.concat([key]) });
+      } else if (!Object.prototype.hasOwnProperty.call(base, key)) {
+        ops.push({ op: "set", path: patchPath.concat([key]), value: cloneJson3(next[key]) });
+      } else {
+        buildPatchOps(base[key], next[key], patchPath.concat([key]), ops);
+      }
+      if (ops.length > 2e3) break;
+    }
+    return ops;
+  }
+  if (Array.isArray(base) && Array.isArray(next)) {
+    if (base.length === next.length) {
+      for (let i = 0; i < next.length; i++) buildPatchOps(base[i], next[i], patchPath.concat([i]), ops);
+      return ops;
+    }
+    ops.push({ op: "set", path: patchPath, value: cloneJson3(next) });
+    return ops;
+  }
+  ops.push({ op: "set", path: patchPath, value: cloneJson3(next) });
+  return ops;
+}
+function makeFullEntry(signature, result) {
+  const data = JSON.parse(result.bodyText || "{}");
+  const hash = sha256(result.bodyText || "{}");
+  return {
+    signature,
+    hash,
+    data,
+    bodyText: result.bodyText || "{}",
+    status: result.status || 200,
+    statusText: result.statusText || "OK",
+    headers: result.headers || { "content-type": JSON_CONTENT_TYPE4 },
+    createdAt: Date.now(),
+    history: /* @__PURE__ */ new Map()
+  };
+}
+function buildDedupBodyText(entry) {
+  const full = entry?.data;
+  const jsonData = typeof full?.json_data === "string" ? full.json_data : "";
+  if (!jsonData) return null;
+  try {
+    const base = JSON.parse(jsonData);
+    if (!base || typeof base !== "object") return null;
+    const baseClean = cloneJson3(base);
+    const target = cloneJson3(full);
+    delete baseClean.json_data;
+    delete target.json_data;
+    const ops = buildPatchOps(baseClean, target);
+    if (ops.length > 2e3) return null;
+    const bodyText = JSON.stringify({ mode: "dedup", hash: entry.hash, json_data: jsonData, ops });
+    return bodyText.length < entry.bodyText.length ? bodyText : null;
+  } catch {
+    return null;
+  }
+}
+function sendCharacterGet(res, entry, req, meta = {}) {
+  const clientHash = getClientHash(req);
+  let mode = "full";
+  let bodyText = entry.bodyText;
+  if (clientHash && clientHash === entry.hash) {
+    mode = "noop";
+    bodyText = JSON.stringify({ mode, hash: entry.hash });
+  } else if (clientHash && entry.history instanceof Map && entry.history.has(clientHash)) {
+    const base = entry.history.get(clientHash);
+    const ops = buildPatchOps(base, entry.data);
+    if (ops.length === 0) {
+      mode = "noop";
+      bodyText = JSON.stringify({ mode, hash: entry.hash });
+    } else if (ops.length <= 2e3) {
+      const patchText = JSON.stringify({ mode: "patch", baseHash: clientHash, nextHash: entry.hash, ops });
+      if (patchText.length < entry.bodyText.length) {
+        mode = "patch";
+        bodyText = patchText;
+      }
+    }
+  }
+  if (mode === "full") {
+    const dedupText = buildDedupBodyText(entry);
+    if (dedupText) {
+      mode = "dedup";
+      bodyText = dedupText;
+    }
+  }
+  res.setHeader(HEADER_PREFIX, "characters-get-fast");
+  res.setHeader(`${HEADER_PREFIX}-character-get-ready`, "1");
+  res.setHeader(`${HEADER_PREFIX}-character-get-patch`, mode);
+  res.setHeader(`${HEADER_PREFIX}-character-get-hash`, entry.hash);
+  res.setHeader(`${HEADER_PREFIX}-character-get-cache`, meta.cache || "");
+  res.setHeader("content-type", JSON_CONTENT_TYPE4);
+  return res.status(entry.status || 200).send(bodyText);
+}
+async function handleCharacterGetFast(req, res) {
+  try {
+    const avatar = getAvatar(req);
+    if (!avatar) return res.sendStatus(400);
+    const ctx = makeRequestContext(req);
+    const cacheKey = getCacheKey3(ctx, avatar);
+    const signature = getCharacterSignature(req, avatar);
+    const cached = characterGetCache.get(cacheKey);
+    if (cached && cached.signature === signature) {
+      return sendCharacterGet(res, cached, req, { cache: "HIT" });
+    }
+    const result = await fetchOriginal(ctx, characterGetEndpoint);
+    if (!result.ok) {
+      res.setHeader(HEADER_PREFIX, "characters-get-fast");
+      res.setHeader("content-type", result.headers?.["content-type"] || JSON_CONTENT_TYPE4);
+      return res.status(result.status || 500).send(result.bodyText || "{}");
+    }
+    const entry = makeFullEntry(signature, result);
+    if (cached?.hash && cached?.data) rememberHistory(entry, cached.hash, cached.data);
+    characterGetCache.set(cacheKey, entry);
+    return sendCharacterGet(res, entry, req, { cache: cached ? "MISS" : "INIT" });
+  } catch (error) {
+    res.setHeader(HEADER_PREFIX, "characters-get-fast");
+    res.setHeader("content-type", JSON_CONTENT_TYPE4);
+    return res.status(500).send(JSON.stringify({ error: true, message: error instanceof Error ? error.message : String(error) }));
+  }
+}
+
+// server-plugins/cocktail-plus/src/endpoints/recent-chats.ts
+import fs14 from "node:fs";
+import path13 from "node:path";
+import readline from "node:readline";
+var JSON_CONTENT_TYPE5 = "application/json; charset=utf-8";
+var DEFAULT_DISPLAYED = 3;
+var DEFAULT_MAX = 15;
+var MAX_LIMIT = 100;
+var SYSTEM_AVATAR = "img/five.png";
+var RECENT_PATCH_HISTORY_LIMIT = 3;
+var recentChatsCache = /* @__PURE__ */ new Map();
+function formatBytes(numBytes) {
+  const bytes = Math.max(0, Number(numBytes) || 0);
+  if (bytes === 0) return "0B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index++;
+  }
+  return `${value.toFixed(index === 0 ? 0 : value >= 10 ? 2 : 2)}${units[index]}`;
+}
+function tryParseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+function normalizeMax(value) {
+  const parsed = Number.parseInt(value ?? DEFAULT_MAX, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX;
+  return Math.min(MAX_LIMIT, parsed);
+}
+function normalizePinned(value) {
+  return Array.isArray(value) ? value : [];
+}
+function normalizePinnedForKey(pinnedChats) {
+  return normalizePinned(pinnedChats).map((p) => ({ avatar: p?.avatar || "", group: p?.group || "", file_name: p?.file_name || "" })).sort((a, b) => `${a.group}|${a.avatar}|${a.file_name}`.localeCompare(`${b.group}|${b.avatar}|${b.file_name}`));
+}
+function getRecentCacheKey(req, max, pinnedChats) {
+  const handle = String(req.user?.profile?.handle || req.user?.profile?.name || "default");
+  const root = String(req.user?.directories?.root || "");
+  return sha256(stableStringify({ root, handle, max, pinned: normalizePinnedForKey(pinnedChats) })).slice(0, 32);
+}
+function getClientPatchHash(req) {
+  const hash = req.body?.cpRecentPatch?.hash;
+  return typeof hash === "string" && hash ? hash : "";
+}
+function sameJson2(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+function buildRecentPatch(base, next) {
+  if (!Array.isArray(base) || !Array.isArray(next)) return null;
+  if (sameJson2(base, next)) return [];
+  const ops = [];
+  if (base.length === next.length) {
+    for (let i = 0; i < next.length; i++) {
+      if (!sameJson2(base[i], next[i])) ops.push({ op: "set", index: i, value: next[i] });
+    }
+    return ops;
+  }
+  const min = Math.min(base.length, next.length);
+  let prefix = 0;
+  while (prefix < min && sameJson2(base[prefix], next[prefix])) prefix++;
+  let suffix = 0;
+  while (suffix < min - prefix && sameJson2(base[base.length - 1 - suffix], next[next.length - 1 - suffix])) suffix++;
+  ops.push({
+    op: "splice",
+    index: prefix,
+    deleteCount: Math.max(0, base.length - prefix - suffix),
+    items: next.slice(prefix, next.length - suffix)
+  });
+  return ops;
+}
+function rememberRecentHistory(entry, hash, data) {
+  if (!entry || !hash || !Array.isArray(data)) return;
+  entry.history = entry.history instanceof Map ? entry.history : /* @__PURE__ */ new Map();
+  entry.history.set(hash, data);
+  while (entry.history.size > RECENT_PATCH_HISTORY_LIMIT) {
+    const first = entry.history.keys().next().value;
+    entry.history.delete(first);
+  }
+}
+function sendRecentPayload(req, res, entry, meta = {}) {
+  const clientHash = getClientPatchHash(req);
+  let mode = "full";
+  let bodyText = entry.bodyText;
+  if (clientHash && clientHash === entry.hash) {
+    mode = "noop";
+    bodyText = JSON.stringify({ mode, hash: entry.hash });
+  } else if (clientHash && entry.history instanceof Map && entry.history.has(clientHash)) {
+    const base = entry.history.get(clientHash);
+    const ops = buildRecentPatch(base, entry.data);
+    if (ops && ops.length === 0) {
+      mode = "noop";
+      bodyText = JSON.stringify({ mode, hash: entry.hash });
+    } else if (ops) {
+      const patchText = JSON.stringify({ mode: "patch", baseHash: clientHash, nextHash: entry.hash, ops });
+      if (patchText.length < entry.bodyText.length) {
+        mode = "patch";
+        bodyText = patchText;
+      }
+    }
+  }
+  res.setHeader(HEADER_PREFIX, "recent-chats-fast");
+  res.setHeader(`${HEADER_PREFIX}-recent-ready`, "1");
+  res.setHeader(`${HEADER_PREFIX}-recent-patch`, mode);
+  res.setHeader(`${HEADER_PREFIX}-recent-hash`, entry.hash);
+  res.setHeader(`${HEADER_PREFIX}-recent-candidates`, String(meta.candidates ?? ""));
+  res.setHeader(`${HEADER_PREFIX}-recent-read`, String(meta.read ?? ""));
+  res.setHeader(`${HEADER_PREFIX}-recent-cache`, meta.cache || "");
+  res.setHeader(`${HEADER_PREFIX}-recent-ms`, String(meta.ms ?? ""));
+  res.setHeader("content-type", JSON_CONTENT_TYPE5);
+  return res.status(200).send(bodyText);
+}
+async function statEntityForSignature(ctx, chatFile) {
+  try {
+    if (chatFile.pngFile && ctx.directories?.characters) {
+      const stat = await safeStat(path13.join(ctx.directories.characters, chatFile.pngFile));
+      return { avatar: chatFile.pngFile, size: stat?.size || 0, mtime: Math.round(stat?.mtimeMs || 0) };
+    }
+    if (chatFile.groupId) {
+      const group = ctx.groupInfoMap?.get(chatFile.groupId) || {};
+      return { group: chatFile.groupId, name: group.name || "", chats: group.chats || [], members: group.members || [], disabled_members: group.disabled_members || [], avatar_url: group.avatar_url || "" };
+    }
+  } catch {
+  }
+  return null;
+}
+async function buildRecentSignature(ctx, selectedFiles, max, pinnedChats) {
+  const files = [];
+  for (const file of selectedFiles) {
+    files.push({
+      filePath: file.filePath,
+      pngFile: file.pngFile || "",
+      groupId: file.groupId || "",
+      mtime: Math.round(file.mtime || 0),
+      size: file.size || 0,
+      entity: await statEntityForSignature(ctx, file)
+    });
+  }
+  return sha256(stableStringify({ max, pinned: normalizePinnedForKey(pinnedChats), files }));
+}
+function isPinnedChat(chatFile, pinnedChats) {
+  const base = path13.basename(chatFile.filePath);
+  return pinnedChats.some((p) => p && p.file_name === base && (p.avatar === chatFile.pngFile || p.group === chatFile.groupId));
+}
+function getThumbnailUrl(type, file) {
+  return `/thumbnail?type=${type}&file=${encodeURIComponent(file)}`;
+}
+function formatDateShort(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  try {
+    return date.toLocaleDateString();
+  } catch {
+    return date.toISOString().slice(0, 10);
+  }
+}
+function formatDateLong(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  try {
+    return date.toLocaleString();
+  } catch {
+    return date.toISOString();
+  }
+}
+async function safeStat(filePath) {
+  try {
+    const stat = await fs14.promises.stat(filePath);
+    return stat.isFile() ? stat : null;
+  } catch {
+    return null;
+  }
+}
+async function listJsonlFiles(directory) {
+  try {
+    const entries = await fs14.promises.readdir(directory, { withFileTypes: true });
+    return entries.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".jsonl").map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+async function collectCharacterChatFiles(ctx, allChatFiles) {
+  const charactersDir = ctx.directories?.characters;
+  const chatsRoot = ctx.directories?.chats;
+  if (!charactersDir || !chatsRoot) return;
+  let entries = [];
+  try {
+    entries = await fs14.promises.readdir(charactersDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const pngFiles = entries.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".png").map((e) => e.name);
+  await Promise.all(pngFiles.map(async (pngFile) => {
+    const chatsDirectory = pngFile.replace(/\.png$/i, "");
+    const pathToChats = path13.join(chatsRoot, chatsDirectory);
+    let dirStat = null;
+    try {
+      dirStat = await fs14.promises.stat(pathToChats);
+    } catch {
+      return;
+    }
+    if (!dirStat.isDirectory()) return;
+    const jsonlFiles = await listJsonlFiles(pathToChats);
+    await Promise.all(jsonlFiles.map(async (file) => {
+      const filePath = path13.join(pathToChats, file);
+      const stat = await safeStat(filePath);
+      if (stat) allChatFiles.push({ pngFile, filePath, mtime: stat.mtimeMs, size: stat.size });
+    }));
+  }));
+}
+async function collectGroupChatFiles(ctx, allChatFiles, groupInfoMap) {
+  const groupsDir = ctx.directories?.groups;
+  const groupChatsDir = ctx.directories?.groupChats;
+  if (!groupsDir || !groupChatsDir) return;
+  let entries = [];
+  try {
+    entries = await fs14.promises.readdir(groupsDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const groupFiles = entries.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".json").map((e) => e.name);
+  await Promise.all(groupFiles.map(async (groupFile) => {
+    try {
+      const groupPath = path13.join(groupsDir, groupFile);
+      const groupData = JSON.parse(await fs14.promises.readFile(groupPath, "utf8"));
+      if (!groupData?.id) return;
+      groupInfoMap.set(groupData.id, {
+        id: groupData.id,
+        name: groupData.name || path13.parse(groupFile).name,
+        avatar_url: groupData.avatar_url || "",
+        chats: Array.isArray(groupData.chats) ? groupData.chats.slice() : [],
+        members: Array.isArray(groupData.members) ? groupData.members.slice() : [],
+        disabled_members: Array.isArray(groupData.disabled_members) ? groupData.disabled_members.slice() : []
+      });
+      if (!Array.isArray(groupData.chats)) return;
+      await Promise.all(groupData.chats.map(async (chat) => {
+        const filePath = path13.join(groupChatsDir, `${chat}.jsonl`);
+        const stat = await safeStat(filePath);
+        if (stat) allChatFiles.push({ groupId: groupData.id, filePath, mtime: stat.mtimeMs, size: stat.size });
+      }));
+    } catch {
+    }
+  }));
+}
+async function collectRootChatFiles(ctx, allChatFiles) {
+  const chatsRoot = ctx.directories?.chats;
+  if (!chatsRoot) return;
+  let entries = [];
+  try {
+    entries = await fs14.promises.readdir(chatsRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const rootJsonlFiles = entries.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".jsonl").map((e) => e.name);
+  await Promise.all(rootJsonlFiles.map(async (file) => {
+    const filePath = path13.join(chatsRoot, file);
+    const stat = await safeStat(filePath);
+    if (stat) allChatFiles.push({ filePath, mtime: stat.mtimeMs, size: stat.size });
+  }));
+}
+async function getChatInfoFast(chatFile) {
+  const parsedPath = path13.parse(chatFile.filePath);
+  const stat = await safeStat(chatFile.filePath);
+  if (!stat) return null;
+  const chatData = {
+    match: true,
+    file_id: parsedPath.name,
+    file_name: parsedPath.base,
+    file_size: formatBytes(stat.size),
+    chat_items: 0,
+    mes: "[The chat is empty]",
+    last_mes: stat.mtimeMs,
+    avatar: chatFile.pngFile,
+    group: chatFile.groupId
+  };
+  if (stat.size === 0) return chatData;
+  return await new Promise((resolve) => {
+    const fileStream = fs14.createReadStream(chatFile.filePath);
+    const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+    let lastLine = "";
+    let itemCounter = 0;
+    let resolved = false;
+    const done = (value) => {
+      if (resolved) return;
+      resolved = true;
+      try {
+        rl.close();
+      } catch {
+      }
+      try {
+        fileStream.destroy();
+      } catch {
+      }
+      resolve(value);
+    };
+    fileStream.on("error", () => done(null));
+    rl.on("line", (line) => {
+      itemCounter++;
+      lastLine = line;
+    });
+    rl.on("close", () => {
+      if (!lastLine) return done(chatData);
+      const jsonData = tryParseJson(lastLine);
+      if (!jsonData || !(jsonData.name || jsonData.character_name || jsonData.chat_metadata)) return done(null);
+      chatData.chat_items = Math.max(0, itemCounter - 1);
+      chatData.mes = jsonData.mes || "[The message is empty]";
+      chatData.last_mes = jsonData.send_date || new Date(Math.round(stat.mtimeMs)).toISOString();
+      done(chatData);
+    });
+  });
+}
+function extractPngTextChunks3(buffer) {
+  const chunks = [];
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return chunks;
+  let offset = 8;
+  while (offset + 12 <= buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.toString("ascii", offset + 4, offset + 8);
+    const dataStart = offset + 8;
+    const dataEnd = dataStart + length;
+    const nextOffset = dataEnd + 4;
+    if (dataEnd > buffer.length || nextOffset > buffer.length) break;
+    if (type === "tEXt") {
+      const separator = buffer.indexOf(0, dataStart);
+      if (separator >= dataStart && separator < dataEnd) {
+        const keyword = buffer.toString("latin1", dataStart, separator).toLowerCase();
+        if (keyword === "chara" || keyword === "ccv3") {
+          chunks.push({ keyword, text: buffer.toString("latin1", separator + 1, dataEnd) });
+        }
+      }
+    }
+    if (type === "IEND") break;
+    offset = nextOffset;
+  }
+  return chunks;
+}
+async function readCharacterName(ctx, avatarFile) {
+  if (!avatarFile) return "";
+  try {
+    const filePath = path13.join(ctx.directories.characters, avatarFile);
+    const buffer = await fs14.promises.readFile(filePath);
+    const chunks = extractPngTextChunks3(buffer);
+    const selected = chunks.find((c) => c.keyword === "ccv3") || chunks.find((c) => c.keyword === "chara");
+    if (!selected) return path13.basename(avatarFile, path13.extname(avatarFile));
+    const raw = JSON.parse(Buffer.from(selected.text, "base64").toString("utf8"));
+    return raw?.data?.name || raw?.name || path13.basename(avatarFile, path13.extname(avatarFile));
+  } catch {
+    return path13.basename(avatarFile, path13.extname(avatarFile));
+  }
+}
+async function enrichRecentChat(ctx, chatInfo, chatFile, index, pinned) {
+  const isGroup = !!chatFile.groupId;
+  const groupInfo = isGroup ? ctx.groupInfoMap?.get(chatFile.groupId) || {} : null;
+  const charName = isGroup ? groupInfo?.name || chatFile.groupId || "" : await readCharacterName(ctx, chatFile.pngFile);
+  const lastMes = chatInfo.last_mes || chatFile.mtime;
+  const fileName = chatInfo.file_name || path13.basename(chatFile.filePath);
+  const avatar = chatInfo.avatar || chatFile.pngFile || "";
+  const group = chatInfo.group || chatFile.groupId || "";
+  return {
+    ...chatInfo,
+    file_name: fileName,
+    chat_name: fileName.replace(/\.jsonl$/i, ""),
+    char_name: charName,
+    date_short: formatDateShort(lastMes),
+    date_long: formatDateLong(lastMes),
+    char_thumbnail: isGroup ? SYSTEM_AVATAR : avatar ? getThumbnailUrl("avatar", avatar) : SYSTEM_AVATAR,
+    is_group: isGroup,
+    group_chats: isGroup ? Array.isArray(groupInfo?.chats) ? groupInfo.chats : [] : void 0,
+    group_members: isGroup ? Array.isArray(groupInfo?.members) ? groupInfo.members : [] : void 0,
+    group_disabled_members: isGroup ? Array.isArray(groupInfo?.disabled_members) ? groupInfo.disabled_members : [] : void 0,
+    group_avatar_url: isGroup ? groupInfo?.avatar_url || "" : void 0,
+    hidden: index >= DEFAULT_DISPLAYED,
+    avatar,
+    group,
+    pinned
+  };
+}
+async function handleRecentChatsFast(req, res) {
+  const startedAt = Date.now();
+  try {
+    const ctx = { directories: req.user?.directories || {}, groupInfoMap: /* @__PURE__ */ new Map() };
+    const pinnedChats = normalizePinned(req.body?.pinned);
+    const max = normalizeMax(req.body?.max) + pinnedChats.length;
+    const cacheKey = getRecentCacheKey(req, max, pinnedChats);
+    const allChatFiles = [];
+    await Promise.allSettled([
+      collectCharacterChatFiles(ctx, allChatFiles),
+      collectGroupChatFiles(ctx, allChatFiles, ctx.groupInfoMap),
+      collectRootChatFiles(ctx, allChatFiles)
+    ]);
+    const selectedFiles = allChatFiles.sort((a, b) => {
+      const aPinned = isPinnedChat(a, pinnedChats);
+      const bPinned = isPinnedChat(b, pinnedChats);
+      if (aPinned && !bPinned) return -1;
+      if (!aPinned && bPinned) return 1;
+      return b.mtime - a.mtime;
+    }).slice(0, max);
+    const signature = await buildRecentSignature(ctx, selectedFiles, max, pinnedChats);
+    const cached = recentChatsCache.get(cacheKey);
+    if (cached && cached.signature === signature) {
+      return sendRecentPayload(req, res, cached, { candidates: allChatFiles.length, read: 0, cache: "HIT", ms: Date.now() - startedAt });
+    }
+    const rows = [];
+    for (const chatFile of selectedFiles) {
+      const chatInfo = await getChatInfoFast(chatFile);
+      if (!chatInfo?.file_name) continue;
+      rows.push({ chatFile, chatInfo, pinned: isPinnedChat(chatFile, pinnedChats) });
+    }
+    const valid = [];
+    for (let index = 0; index < rows.length; index++) {
+      valid.push(await enrichRecentChat(ctx, rows[index].chatInfo, rows[index].chatFile, index, rows[index].pinned));
+    }
+    const bodyText = JSON.stringify(valid);
+    const hash = sha256(bodyText);
+    const history = cached?.history instanceof Map ? cached.history : /* @__PURE__ */ new Map();
+    if (cached?.hash && Array.isArray(cached?.data)) rememberRecentHistory({ history }, cached.hash, cached.data);
+    const entry = {
+      signature,
+      data: valid,
+      bodyText,
+      hash,
+      history,
+      createdAt: Date.now()
+    };
+    recentChatsCache.set(cacheKey, entry);
+    return sendRecentPayload(req, res, entry, { candidates: allChatFiles.length, read: selectedFiles.length, cache: cached ? "MISS" : "INIT", ms: Date.now() - startedAt });
+  } catch (error) {
+    res.setHeader(HEADER_PREFIX, "recent-chats-fast");
+    res.setHeader("content-type", JSON_CONTENT_TYPE5);
+    return res.status(500).send(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+  }
+}
+
 // server-plugins/cocktail-plus/src/module-proxy.ts
 import crypto2 from "node:crypto";
-import fs11 from "node:fs";
-import path10 from "node:path";
+import fs15 from "node:fs";
+import path14 from "node:path";
 var TARGET_PROXY_MODULE_PATHS = /* @__PURE__ */ new Set(["/script.js", "/scripts/i18n.js", "/scripts/system-messages.js", "/scripts/extensions.js", "/scripts/welcome-screen.js"]);
 function getPublicRoot() {
-  return path10.join(getServerRoot(), "public");
+  return path14.join(getServerRoot(), "public");
 }
 function normalizePublicPath(value) {
   const publicRoot = getPublicRoot();
@@ -4655,8 +6044,8 @@ function normalizePublicPath(value) {
   raw = decodeURIComponent(raw);
   if (!raw.endsWith(".js")) throw new Error("Only JavaScript modules can be proxied");
   if (raw.includes("\0")) throw new Error("Invalid module path");
-  const fullPath = path10.resolve(publicRoot, `.${raw}`);
-  if (!fullPath.startsWith(publicRoot + path10.sep) && fullPath !== publicRoot) {
+  const fullPath = path14.resolve(publicRoot, `.${raw}`);
+  if (!fullPath.startsWith(publicRoot + path14.sep) && fullPath !== publicRoot) {
     throw new Error("Module path escapes public root");
   }
   return { publicPath: raw.replace(/\\/g, "/"), fullPath };
@@ -4670,8 +6059,8 @@ function toProxySpecifier(currentPublicPath, specifier) {
   if (!specifier.startsWith(".") && !specifier.startsWith("/")) return specifier;
   const [withoutHash, hash = ""] = specifier.split("#");
   const [withoutQuery, query = ""] = withoutHash.split("?");
-  const baseDir = path10.posix.dirname(currentPublicPath);
-  const resolved = specifier.startsWith("/") ? path10.posix.normalize(withoutQuery) : path10.posix.normalize(path10.posix.join(baseDir, withoutQuery));
+  const baseDir = path14.posix.dirname(currentPublicPath);
+  const resolved = specifier.startsWith("/") ? path14.posix.normalize(withoutQuery) : path14.posix.normalize(path14.posix.join(baseDir, withoutQuery));
   const normalized = resolved.startsWith("/") ? resolved : `/${resolved}`;
   const suffix = `${query ? `?${query}` : ""}${hash ? `#${hash}` : ""}`;
   if (normalized === "/lib.js" || normalized.startsWith("/lib/")) {
@@ -4950,18 +6339,22 @@ function patchWelcomeScreenJs(source) {
   out = out.replace(
     /([ \t]*)const\s+recentChats\s*=\s*await\s+getRecentChats\(\)\s*;\s*\r?\n\1const\s+chatAfterFetch\s*=\s*getCurrentChatId\(\)\s*;\s*\r?\n\1if\s*\(chatAfterFetch\s*!==\s*currentChatId\)\s*\{\s*\r?\n\1[ \t]*console\.debug\('Chat changed while fetching recent chats\.'\);\s*\r?\n\1[ \t]*return;\s*\r?\n\1\}\s*\r?\n\s*\r?\n\1if\s*\(chatAfterFetch\s*===\s*undefined\s*&&\s*force\)\s*\{\s*\r?\n\1[ \t]*console\.debug\('Forcing welcome screen open\.'\);\s*\r?\n\1[ \t]*chat\.splice\(0,\s*chat\.length\);\s*\r?\n\1[ \t]*\$\('#chat'\)\.empty\(\);\s*\r?\n\1\}\s*\r?\n\s*\r?\n\1await\s+sendWelcomePanel\(recentChats,\s*expand\)\s*;\s*\r?\n\1await\s+unshallowPermanentAssistant\(\)\s*;\s*\r?\n\1sendAssistantMessage\(\)\s*;\s*\r?\n\1sendWelcomePrompt\(\)\s*;/,
     (_match, indent) => [
+      `${indent}const cpExistingWelcomePanel = document.querySelector('#chat .welcomePanel');`,
       `${indent}globalThis.__cocktailPlusEarlyBridge?.startRecentChatsProgress?.();`,
       `${indent}const recentChatsPromise = getRecentChats();`,
-      `${indent}if (currentChatId === undefined && force) {`,
+      `${indent}if (currentChatId === undefined && force && !cpExistingWelcomePanel) {`,
       `${indent}    console.debug('Forcing welcome screen open.');`,
       `${indent}    chat.splice(0, chat.length);`,
       `${indent}    $('#chat').empty();`,
       `${indent}}`,
       `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('welcome.skeleton-before');`,
+      `${indent}if (!cpExistingWelcomePanel) {`,
       `${indent}await sendWelcomePanel([], expand);`,
+      `${indent}}`,
       `${indent}globalThis.__cocktailPlusEarlyBridge?.updateRecentChatsProgress?.({ phase: 'requesting', message: '\u7B49\u5F85 /recent \u8FD4\u56DE\u6700\u8FD1\u6D88\u606F\u2026' });`,
       `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('welcome.skeleton-after');`,
       `${indent}void recentChatsPromise.then(async (recentChats) => {`,
+      `${indent}    let cpRecentChats = recentChats;`,
       `${indent}    const chatAfterFetch = getCurrentChatId();`,
       `${indent}    if (chatAfterFetch !== currentChatId) {`,
       `${indent}        console.debug('Chat changed while fetching recent chats.');`,
@@ -4969,19 +6362,108 @@ function patchWelcomeScreenJs(source) {
       `${indent}        return;`,
       `${indent}    }`,
       `${indent}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('welcome.recent-before');`,
-      `${indent}    await sendWelcomePanel(recentChats, expand);`,
+      `${indent}    await sendWelcomePanel(cpRecentChats, expand);`,
       `${indent}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('welcome.recent-after');`,
       `${indent}    globalThis.__cocktailPlusEarlyBridge?.finishRecentChatsProgress?.('rendered');`,
       `${indent}}).catch(error => {`,
       `${indent}    globalThis.__cocktailPlusEarlyBridge?.failRecentChatsProgress?.(error);`,
       `${indent}    console.error('Welcome recent chats error:', error);`,
       `${indent}});`,
+      `${indent}if (!cpExistingWelcomePanel) {`,
       `${indent}void (async () => {`,
       `${indent}    await unshallowPermanentAssistant();`,
       `${indent}    sendAssistantMessage();`,
       `${indent}    sendWelcomePrompt();`,
-      `${indent}})().catch(error => console.error('Welcome assistant error:', error));`
+      `${indent}})().catch(error => console.error('Welcome assistant error:', error));`,
+      `${indent}}`
     ].join("\n")
+  );
+  out = out.replace(
+    /([ \t]*)const\s+data\s*=\s*await\s+response\.json\(\)\s*;\s*\r?\n/,
+    (_match, indent) => [
+      `${indent}const data = await response.json();`,
+      `${indent}if (response.headers?.get?.('x-cocktail-plus-recent-ready') === '1') {`,
+      `${indent}    globalThis.__cocktailPlusEarlyBridge && (globalThis.__cocktailPlusEarlyBridge.recentChatsData = Array.isArray(data) ? data : []);`,
+      `${indent}    return Array.isArray(data) ? data : [];`,
+      `${indent}}`
+    ].join("\n") + "\n"
+  );
+  if (!out.includes("function cpEnsureRecentCharacterEntity")) {
+    out = out.replace(
+      /(\/\*\*\s*\r?\n\s*\* Opens a recent character chat\.)/,
+      `function cpRecentChatElement(match) {
+    try {
+        return Array.from(document.querySelectorAll('.recentChat')).find(el => {
+            if (!el || typeof el.getAttribute !== 'function') return false;
+            if (match.avatarId && el.getAttribute('data-avatar') === match.avatarId) return true;
+            if (match.groupId && el.getAttribute('data-group') === match.groupId) return true;
+            return false;
+        }) || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function cpRecentDisplayName(match, fallback) {
+    const element = cpRecentChatElement(match);
+    const name = element?.querySelector?.('.characterName')?.textContent?.trim();
+    const row = cpRecentData(match);
+    return name || row?.char_name || fallback || '';
+}
+
+function cpRecentData(match) {
+    const rows = globalThis.__cocktailPlusEarlyBridge?.recentChatsData;
+    if (!Array.isArray(rows)) return null;
+    return rows.find(row => {
+        if (!row) return false;
+        if (match.avatarId && row.avatar === match.avatarId && (!match.fileName || row.chat_name === match.fileName || row.file_name === match.fileName + '.jsonl')) return true;
+        if (match.groupId && row.group === match.groupId && (!match.fileName || row.chat_name === match.fileName || row.file_name === match.fileName + '.jsonl')) return true;
+        return false;
+    }) || null;
+}
+
+function cpEnsureRecentCharacterEntity(avatarId, fileName) {
+    let characterId = characters.findIndex(x => x.avatar === avatarId);
+    if (characterId === -1 && avatarId) {
+        const name = cpRecentDisplayName({ avatarId, fileName }, String(avatarId).replace(/\\.png$/i, ''));
+        characters.push({
+            shallow: true,
+            name,
+            avatar: avatarId,
+            chat: fileName,
+            fav: false,
+            tags: [],
+            data: { name, tags: [], extensions: { fav: false } },
+        });
+        characterId = characters.length - 1;
+    }
+    if (characterId !== -1 && fileName) characters[characterId].chat = fileName;
+    return characterId;
+}
+
+function cpEnsureRecentGroupEntity(groupId, fileName) {
+    let group = groups.find(x => x.id === groupId);
+    if (!group && groupId) {
+        const row = cpRecentData({ groupId, fileName });
+        const chats = Array.isArray(row?.group_chats) && row.group_chats.length ? row.group_chats.slice() : (fileName ? [fileName] : []);
+        group = { id: groupId, name: cpRecentDisplayName({ groupId, fileName }, groupId), chat_id: fileName || row?.chat_name || '', chats, members: Array.isArray(row?.group_members) ? row.group_members.slice() : [], disabled_members: Array.isArray(row?.group_disabled_members) ? row.group_disabled_members.slice() : [], avatar_url: row?.group_avatar_url || '' };
+        groups.push(group);
+    }
+    if (group && fileName && Array.isArray(group.chats) && !group.chats.includes(fileName)) group.chats.push(fileName);
+    if (group && fileName && !group.chat_id) group.chat_id = fileName;
+    return group;
+}
+
+$1`
+    );
+  }
+  out = out.replaceAll(
+    `const characterId = characters.findIndex(x => x.avatar === avatarId);`,
+    `const characterId = cpEnsureRecentCharacterEntity(avatarId, fileName);`
+  );
+  out = out.replaceAll(
+    `const group = groups.find(x => x.id === groupId);`,
+    `const group = cpEnsureRecentGroupEntity(groupId, typeof fileName !== 'undefined' ? fileName : undefined);`
   );
   out = out.replace(
     /([ \t]*)chatElement\.append\(fragment\.firstChild\);/,
@@ -5016,7 +6498,7 @@ function makeEtag(source) {
 async function handleModuleProxy(req, res) {
   try {
     const { publicPath, fullPath } = normalizePublicPath(req.query?.path || req.path || "");
-    let source = await fs11.promises.readFile(fullPath, "utf8");
+    let source = await fs15.promises.readFile(fullPath, "utf8");
     source = applyTargetedPatches(source, publicPath);
     source = rewriteModuleSpecifiers(source, publicPath);
     source += `
@@ -5039,8 +6521,8 @@ async function handleModuleProxy(req, res) {
 }
 
 // server-plugins/cocktail-plus/src/source-patches.ts
-import fs12 from "node:fs";
-import path11 from "node:path";
+import fs16 from "node:fs";
+import path15 from "node:path";
 var CHAT_INFO_ENOENT_SENTINEL = "Chat file no longer exists, skipping";
 var CHAT_STREAM_ENOENT_SENTINEL = "Chat file disappeared while reading, skipping";
 var ORIGINAL_STAT_LINE = `        const stats = await fs.promises.stat(pathToFile);`;
@@ -5070,14 +6552,14 @@ var PATCHED_STREAM_BLOCK = `        const fileStream = fs.createReadStream(pathT
         });
         const rl = readline.createInterface({`;
 function getChatsEndpointPath() {
-  return path11.join(getServerRoot(), "src", "endpoints", "chats.js");
+  return path15.join(getServerRoot(), "src", "endpoints", "chats.js");
 }
 function readChatsSource(filePath) {
-  if (!fs12.existsSync(filePath)) return { exists: false, text: "" };
-  return { exists: true, text: fs12.readFileSync(filePath, "utf8") };
+  if (!fs16.existsSync(filePath)) return { exists: false, text: "" };
+  return { exists: true, text: fs16.readFileSync(filePath, "utf8") };
 }
 function writeUtf8NoBom(filePath, text) {
-  fs12.writeFileSync(filePath, text, { encoding: "utf8" });
+  fs16.writeFileSync(filePath, text, { encoding: "utf8" });
 }
 function replaceOnce(text, search, replacement, label) {
   if (!text.includes(search)) throw new Error(`${label} pattern not found`);
@@ -5128,7 +6610,7 @@ function applyChatsEnoentPatch() {
   if (!status.ok) return { ...status, changed: false, action: "apply" };
   if (!status.exists) return { ...status, ok: false, changed: false, action: "apply", error: "chats.js not found" };
   const filePath = status.filePath;
-  let text = fs12.readFileSync(filePath, "utf8");
+  let text = fs16.readFileSync(filePath, "utf8");
   const original = text;
   if (!text.includes(CHAT_INFO_ENOENT_SENTINEL)) {
     text = replaceOnce(text, ORIGINAL_STAT_LINE, PATCHED_STAT_BLOCK, "stat");
@@ -5147,7 +6629,7 @@ function revertChatsEnoentPatch() {
   if (!status.ok) return { ...status, changed: false, action: "revert" };
   if (!status.exists) return { ...status, ok: false, changed: false, action: "revert", error: "chats.js not found" };
   const filePath = status.filePath;
-  let text = fs12.readFileSync(filePath, "utf8");
+  let text = fs16.readFileSync(filePath, "utf8");
   const original = text;
   text = removeStatPatch(text);
   text = removeStreamPatch(text);
@@ -5232,13 +6714,13 @@ function registerRoutes(router) {
       res.status(404).type("text/plain").send("Not found");
       return;
     }
-    const filePath = path12.join(PLUGIN_DIR, "scripts", fileName);
-    if (!fs13.existsSync(filePath)) {
+    const filePath = path16.join(PLUGIN_DIR, "scripts", fileName);
+    if (!fs17.existsSync(filePath)) {
       res.status(404).type("text/plain").send("Helper script not found");
       return;
     }
     res.setHeader("cache-control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-    res.type("text/plain; charset=utf-8").send(fs13.readFileSync(filePath, "utf8"));
+    res.type("text/plain; charset=utf-8").send(fs17.readFileSync(filePath, "utf8"));
   });
   router.get("/module", async (req, res) => handleModuleProxy(req, res));
   router.post("/early/status", async (_req, res) => {
@@ -5269,6 +6751,9 @@ function registerRoutes(router) {
   router.post(settingsSaveEndpoint.fastPath, async (req, res) => handleSettingsSaveFast(req, res));
   router.post(chatSaveEndpoint.fastPath, async (req, res) => handleChatSaveFast(req, res, chatSaveEndpoint));
   router.post(groupChatSaveEndpoint.fastPath, async (req, res) => handleChatSaveFast(req, res, groupChatSaveEndpoint));
+  router.post("/fast/recent-chats", async (req, res) => handleRecentChatsFast(req, res));
+  router.post("/fast/characters-get", async (req, res) => handleCharacterGetFast(req, res));
+  router.post("/fast/characters-edit", async (req, res) => handleCharacterEditFast(req, res));
   router.post("/warm", async (req, res) => {
     const endpointKeys = parseEndpointList(req.body?.endpoints, ["characters-all"]);
     const wait = asBoolean(req.body?.wait, false);

@@ -22,7 +22,7 @@ function readVersion() {
         const version = String(parsed?.version || '').trim();
         if (version) return version;
     } catch {}
-    return '0.1.11';
+    return '0.1.12';
 }
 
 export const VERSION = readVersion();

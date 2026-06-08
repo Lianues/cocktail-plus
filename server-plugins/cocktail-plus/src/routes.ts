@@ -11,8 +11,11 @@ import { getUserStatus, invalidateForUser, summarizeEntry } from './cache-store.
 import { makeServiceWorkerScript } from './service-worker.js';
 import { getEarlyBridgeStatus, installEarlyBridge, makeEarlyBridgeScript, uninstallEarlyBridge } from './early-bridge.js';
 import { chatSaveEndpoint, getChatSaveStatus, groupChatSaveEndpoint, handleChatSaveFast } from './endpoints/chat-save.js';
+import { handleCharacterEditFast } from './endpoints/characters-edit.js';
+import { handleCharacterGetFast } from './endpoints/characters-get.js';
 import { getSettingsSaveStatus, handleSettingsSaveFast, settingsSaveEndpoint } from './endpoints/settings-save.js';
 import { clearSettingsGetCache, getSettingsGetStatus, handleSettingsGetFast, settingsGetEndpoint } from './endpoints/settings-get.js';
+import { handleRecentChatsFast } from './endpoints/recent-chats.js';
 import { handleModuleProxy } from './module-proxy.js';
 import { getDataRoot, getServerRoot } from './utils.js';
 import { applyChatsEnoentPatch, getChatsEnoentPatchStatus, revertChatsEnoentPatch } from './source-patches.js';
@@ -130,6 +133,9 @@ export function registerRoutes(router) {
     router.post(settingsSaveEndpoint.fastPath, async (req, res) => handleSettingsSaveFast(req, res));
     router.post(chatSaveEndpoint.fastPath, async (req, res) => handleChatSaveFast(req, res, chatSaveEndpoint));
     router.post(groupChatSaveEndpoint.fastPath, async (req, res) => handleChatSaveFast(req, res, groupChatSaveEndpoint));
+    router.post('/fast/recent-chats', async (req, res) => handleRecentChatsFast(req, res));
+    router.post('/fast/characters-get', async (req, res) => handleCharacterGetFast(req, res));
+    router.post('/fast/characters-edit', async (req, res) => handleCharacterEditFast(req, res));
 
     router.post('/warm', async (req, res) => {
         const endpointKeys = parseEndpointList(req.body?.endpoints, ['characters-all']);

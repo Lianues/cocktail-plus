@@ -1051,6 +1051,10 @@ async function init() {
   var _a, _b, _c, _d, _e, _f, _g, _h, _i;
   if (globalThis[EXTENSION_LOADED_FLAG]) return;
   globalThis[EXTENSION_LOADED_FLAG] = true;
+  const shouldRefreshCharactersAfterFastState = (cache) => {
+    const state2 = String(cache || "");
+    return state2 === "ASYNC-MISS" || state2 === "STALE-SIGNATURE";
+  };
   ensureLocalSettings();
   const early = globalThis.__cocktailPlusEarlyBridge;
   if (early) {
@@ -1062,7 +1066,7 @@ async function init() {
     });
     if (Array.isArray(early.events) && early.events.some((e) => {
       var _a2, _b2;
-      return ((_a2 = e == null ? void 0 : e.detail) == null ? void 0 : _a2.path) === "/api/characters/all" && ((_b2 = e == null ? void 0 : e.detail) == null ? void 0 : _b2.cache) === "ASYNC-MISS";
+      return ((_a2 = e == null ? void 0 : e.detail) == null ? void 0 : _a2.path) === "/api/characters/all" && shouldRefreshCharactersAfterFastState((_b2 = e == null ? void 0 : e.detail) == null ? void 0 : _b2.cache);
     })) {
       scheduleCharactersRefreshAfterAsyncMiss();
     }
@@ -1071,7 +1075,7 @@ async function init() {
     var _a2, _b2;
     const item = event == null ? void 0 : event.detail;
     log(`EARLY: ${(item == null ? void 0 : item.type) || "event"}`);
-    if (((_a2 = item == null ? void 0 : item.detail) == null ? void 0 : _a2.path) === "/api/characters/all" && ((_b2 = item == null ? void 0 : item.detail) == null ? void 0 : _b2.cache) === "ASYNC-MISS") scheduleCharactersRefreshAfterAsyncMiss();
+    if (((_a2 = item == null ? void 0 : item.detail) == null ? void 0 : _a2.path) === "/api/characters/all" && shouldRefreshCharactersAfterFastState((_b2 = item == null ? void 0 : item.detail) == null ? void 0 : _b2.cache)) scheduleCharactersRefreshAfterAsyncMiss();
   });
   installFetchObserver();
   log("extension init", {
@@ -1094,9 +1098,9 @@ async function init() {
     const data = event.data;
     if ((data == null ? void 0 : data.source) === SW_MESSAGE_SOURCE) {
       log(`SW: ${data.type || "message"}`);
-      if (data.path === "/api/characters/all" && data.cache === "ASYNC-MISS") {
+      if (data.path === "/api/characters/all" && shouldRefreshCharactersAfterFastState(data.cache)) {
         try {
-          (_b2 = (_a2 = globalThis.__cocktailPlusEarlyBridge) == null ? void 0 : _a2.updateCharactersLoadProgress) == null ? void 0 : _b2.call(_a2, { cache: "ASYNC-MISS", phase: "requesting", ...data.progress || {} });
+          (_b2 = (_a2 = globalThis.__cocktailPlusEarlyBridge) == null ? void 0 : _a2.updateCharactersLoadProgress) == null ? void 0 : _b2.call(_a2, { cache: data.cache, phase: "requesting", ...data.progress || {} });
         } catch {
         }
         scheduleCharactersRefreshAfterAsyncMiss();

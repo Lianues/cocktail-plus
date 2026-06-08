@@ -322,6 +322,8 @@ ${fastRoutes}
   var characterProgressRowTimer = null;
   var recentProgressRenderTimer = null;
   var recentProgressRemoveTimer = null;
+  var recentChatsPatchBaselines = new Map();
+  var characterGetPatchBaselines = new Map();
 
   function cpNumber(value, fallback) {
     if (value === null || value === undefined || value === '') return fallback;
@@ -404,6 +406,8 @@ ${fastRoutes}
     var phase = String(data && data.phase || '');
     if (cache === 'ASYNC-MISS') return '后端正在构建角色缓存，首次加载可能较久…';
     if (phase === 'requesting' || phase === 'starting') return '等待 SillyTavern 原始接口返回角色列表…';
+    if (phase === 'scanning') return '正在扫描角色卡文件…';
+    if (phase === 'reading') return '正在读取角色卡元数据并构建缓存…';
     if (phase === 'downloading') return '正在下载角色列表数据…';
     if (phase === 'transforming') return '正在整理角色缓存…';
     if (phase === 'cached') return '缓存已就绪，正在刷新角色列表…';
@@ -430,12 +434,18 @@ ${fastRoutes}
       var parts = [];
       var received = Math.max(0, cpNumber(data.bytesReceived, 0) || 0);
       var total = cpNumber(data.totalBytes, null);
-      if (total && total > 0) parts.push('已接收 ' + cpFormatBytes(received) + ' / ' + cpFormatBytes(total));
-      else if (received > 0) parts.push('已接收 ' + cpFormatBytes(received));
+      var phase = String(data.phase || '');
+      var bytesLabel = (phase === 'reading' || phase === 'scanning') ? '已读取 ' : (phase === 'transforming' || phase === 'cached') ? '已处理 ' : '已接收 ';
+      var speedLabel = (phase === 'reading' || phase === 'scanning') ? '读取速度 ' : (phase === 'transforming' || phase === 'cached') ? '处理速度 ' : '';
+      if (total && total > 0) parts.push(bytesLabel + cpFormatBytes(received) + ' / ' + cpFormatBytes(total));
+      else if (received > 0) parts.push(bytesLabel + cpFormatBytes(received));
       if (determinate) parts.push(percent.toFixed(1) + '%');
-      if ((cpNumber(data.speedBps, 0) || 0) > 0) parts.push(cpFormatBytes(data.speedBps) + '/s');
+      if ((cpNumber(data.speedBps, 0) || 0) > 0) parts.push(speedLabel + cpFormatBytes(data.speedBps) + '/s');
       if (cpNumber(data.etaMs, null) !== null && (cpNumber(data.etaMs, 0) || 0) > 0) parts.push('剩余 ' + cpFormatDuration(data.etaMs));
       else if (data.startedAt) parts.push('已用 ' + cpFormatDuration(Date.now() - data.startedAt));
+      if (cpNumber(data.totalCount, null) !== null) parts.push('角色 ' + (cpNumber(data.count, 0) || 0) + ' / ' + (cpNumber(data.totalCount, 0) || 0));
+      else if (cpNumber(data.count, null) !== null) parts.push('角色 ' + (cpNumber(data.count, 0) || 0));
+      if ((cpNumber(data.errors, 0) || 0) > 0) parts.push('跳过 ' + (cpNumber(data.errors, 0) || 0));
       if (data.cache) parts.push('缓存状态 ' + data.cache);
       if (data.phase) parts.push('阶段 ' + data.phase);
       if (data.error) parts.push('错误 ' + data.error);
@@ -539,7 +549,21 @@ ${fastRoutes}
   }
 
   function cpGetRecentChatList() {
-    try { return document.querySelector('#chat .welcomePanel .recentChatList') || document.querySelector('.welcomePanel .recentChatList'); } catch (_) { return null; }
+    try {
+      var lists = cpGetRecentChatLists();
+      for (var i = 0; i < lists.length; i++) {
+        if (lists[i] && lists[i].querySelector('#cocktail-plus-recent-load-progress')) return lists[i];
+      }
+      return document.querySelector('#chat .welcomePanel .recentChatList') || document.querySelector('.welcomePanel .recentChatList');
+    } catch (_) { return null; }
+  }
+
+  function cpGetRecentChatLists() {
+    try { return Array.prototype.slice.call(document.querySelectorAll('.welcomePanel .recentChatList')); } catch (_) { return []; }
+  }
+
+  function cpGetRecentProgressHost() {
+    try { return document.querySelector('#chat .welcomePanel .recentChatsTitle') || document.querySelector('.welcomePanel .recentChatsTitle') || cpGetRecentChatList(); } catch (_) { return null; }
   }
 
   function cpEnsureRecentProgressStyle() {
@@ -548,14 +572,14 @@ ${fastRoutes}
       var style = document.createElement('style');
       style.id = 'cocktail-plus-recent-load-style';
       style.textContent = [
-        '#cocktail-plus-recent-load-progress{box-sizing:border-box;width:100%;margin:4px 0 8px;padding:12px;border:1px solid rgba(120,220,255,.35);border-radius:10px;background:linear-gradient(180deg,rgba(28,43,58,.96),rgba(18,26,36,.96));box-shadow:0 8px 24px rgba(0,0,0,.16);color:#e9f8ff;font-size:13px;line-height:1.45;}',
-        '#cocktail-plus-recent-load-progress .cp-recent-progress-title{font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:8px;}',
-        '#cocktail-plus-recent-load-progress .cp-recent-progress-title:before{content:"";display:inline-block;width:8px;height:8px;border-radius:999px;background:#72e0ff;box-shadow:0 0 10px #72e0ff;}',
-        '#cocktail-plus-recent-load-progress .cp-recent-progress-message{opacity:.92;margin-bottom:8px;}',
-        '#cocktail-plus-recent-load-progress .cp-recent-progress-track{position:relative;overflow:hidden;height:8px;border-radius:999px;background:rgba(255,255,255,.12);}',
+        '#cocktail-plus-recent-load-progress{box-sizing:border-box;display:inline-flex;align-items:center;gap:6px;max-width:min(46vw,360px);margin-left:10px;padding:2px 7px;border:1px solid rgba(120,220,255,.38);border-radius:999px;background:rgba(18,34,46,.72);color:#e9f8ff;font-size:11px;font-weight:500;line-height:1.2;vertical-align:middle;white-space:nowrap;overflow:hidden;}',
+        '#cocktail-plus-recent-load-progress .cp-recent-progress-title{display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;font-weight:700;}',
+        '#cocktail-plus-recent-load-progress .cp-recent-progress-title:before{content:"";display:inline-block;width:6px;height:6px;border-radius:999px;background:#72e0ff;box-shadow:0 0 8px #72e0ff;}',
+        '#cocktail-plus-recent-load-progress .cp-recent-progress-message{display:none;}',
+        '#cocktail-plus-recent-load-progress .cp-recent-progress-track{position:relative;overflow:hidden;flex:0 0 44px;width:44px;height:4px;border-radius:999px;background:rgba(255,255,255,.16);}',
         '#cocktail-plus-recent-load-progress .cp-recent-progress-bar{height:100%;width:0%;border-radius:999px;background:linear-gradient(90deg,#6ee7ff,#8fffb8);transition:width .18s ease;}',
         '#cocktail-plus-recent-load-progress.cp-indeterminate .cp-recent-progress-bar{width:38%;animation:cpRecentIndeterminate 1.2s ease-in-out infinite;}',
-        '#cocktail-plus-recent-load-progress .cp-recent-progress-meta{margin-top:8px;display:flex;flex-wrap:wrap;gap:8px 12px;opacity:.78;font-size:12px;}',
+        '#cocktail-plus-recent-load-progress .cp-recent-progress-meta{min-width:0;overflow:hidden;text-overflow:ellipsis;opacity:.82;font-size:11px;font-weight:400;}',
         '.welcomePanel .recentChatList.cp-recent-loading .noRecentChat{display:none!important;}',
         '@keyframes cpRecentIndeterminate{0%{transform:translateX(-110%)}50%{transform:translateX(60%)}100%{transform:translateX(260%)}}'
       ].join('');
@@ -564,19 +588,21 @@ ${fastRoutes}
   }
 
   function cpEnsureRecentProgressElement() {
-    var list = cpGetRecentChatList();
-    if (!list) return null;
+    var host = cpGetRecentProgressHost();
+    if (!host) return null;
     cpEnsureRecentProgressStyle();
-    list.classList.add('cp-recent-loading');
+    cpGetRecentChatLists().forEach(function (list) {
+      try { list.classList.add('cp-recent-loading'); } catch (_) {}
+    });
     var el = document.getElementById('cocktail-plus-recent-load-progress');
     if (!el) {
       el = document.createElement('div');
       el.id = 'cocktail-plus-recent-load-progress';
       el.setAttribute('role', 'status');
       el.setAttribute('aria-live', 'polite');
-      el.innerHTML = '<div class="cp-recent-progress-title">鸡尾酒+ 正在加载最近消息</div><div class="cp-recent-progress-message"></div><div class="cp-recent-progress-track"><div class="cp-recent-progress-bar"></div></div><div class="cp-recent-progress-meta"></div>';
+      el.innerHTML = '<span class="cp-recent-progress-title">加载最近</span><span class="cp-recent-progress-message"></span><span class="cp-recent-progress-track"><span class="cp-recent-progress-bar"></span></span><span class="cp-recent-progress-meta"></span>';
     }
-    if (el.parentNode !== list) list.insertBefore(el, list.firstChild || null);
+    if (el.parentNode !== host) host.appendChild(el);
     return el;
   }
 
@@ -592,10 +618,40 @@ ${fastRoutes}
     return '正在加载最近消息…';
   }
 
+  function cpRecentListHasRenderedContent(expectedItems) {
+    try {
+      var lists = cpGetRecentChatLists();
+      var expected = cpNumber(expectedItems, null);
+      for (var i = 0; i < lists.length; i++) {
+        var list = lists[i];
+        if (!list) continue;
+        if (expected === 0 && list.querySelector('.noRecentChat')) return true;
+        if (expected === null && list.querySelector('.recentChat,[data-file],.noRecentChat')) return true;
+        if ((expected === null || expected > 0) && list.querySelector('.recentChat,[data-file]')) return true;
+        if (expected > 0) {
+          var children = Array.prototype.slice.call(list.children || []);
+          for (var j = 0; j < children.length; j++) {
+            var child = children[j];
+            if (!child) continue;
+            if (child.id === 'cocktail-plus-recent-load-progress') continue;
+            if (child.classList && child.classList.contains('noRecentChat')) continue;
+            if (child.classList && child.classList.contains('showMoreChats')) continue;
+            return true;
+          }
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
   function cpRenderRecentProgress() {
     try {
       var data = state.recentChatsLoad || {};
       if (!data.active) return;
+      if (String(data.phase || '') === 'rendering' && cpRecentListHasRenderedContent(data.expectedItems)) {
+        cpRemoveRecentProgress();
+        return;
+      }
       var el = cpEnsureRecentProgressElement();
       if (!el) return;
       var percent = cpClampPercent(data.percent);
@@ -665,10 +721,12 @@ ${fastRoutes}
     try {
       if (recentProgressRemoveTimer) { clearTimeout(recentProgressRemoveTimer); recentProgressRemoveTimer = null; }
       state.recentChatsLoad.active = false;
-      var list = cpGetRecentChatList();
-      if (list) list.classList.remove('cp-recent-loading');
-      var el = document.getElementById('cocktail-plus-recent-load-progress');
-      if (el && el.parentNode) el.parentNode.removeChild(el);
+      cpGetRecentChatLists().forEach(function (list) {
+        try { list.classList.remove('cp-recent-loading'); } catch (_) {}
+      });
+      Array.prototype.slice.call(document.querySelectorAll('#cocktail-plus-recent-load-progress')).forEach(function (el) {
+        try { if (el && el.parentNode) el.parentNode.removeChild(el); } catch (_) {}
+      });
     } catch (_) {}
   }
 
@@ -742,12 +800,40 @@ ${fastRoutes}
     }
   }
 
+  function cpShouldInvalidateSettingsGet(pathname) {
+    return pathname === '/api/worldinfo/import'
+      || pathname === '/api/worldinfo/delete'
+      || pathname === '/api/worldinfo/edit'
+      || pathname === SETTINGS_SAVE.originalSavePath;
+  }
+
+  async function cpInvalidateSettingsGet(rawFetch, input, init, reason) {
+    try {
+      settingsGetPrefetch = null;
+      var headers = cloneHeaders(input, init);
+      headers.set('content-type', 'application/json');
+      await rawFetch(PREFIX + '/cache/clear', {
+        method: 'POST',
+        headers: headers,
+        credentials: (init && init.credentials) || 'same-origin',
+        cache: 'no-store',
+        redirect: 'manual',
+        body: JSON.stringify({ endpoints: [] })
+      });
+      remember('settings.get.invalidate', { reason: reason || '' });
+    } catch (error) {
+      remember('settings.get.invalidate-error', { reason: reason || '', error: String(error && error.message || error) });
+    }
+  }
+
   async function cpFetchWithInvalidation(rawFetch, input, init, url, method) {
     var endpoints = url && url.origin === location.origin && method === 'POST' ? cpEndpointsToInvalidate(url.pathname) : [];
-    if (!endpoints.length) return rawFetch(input, init);
+    var invalidateSettingsGet = url && url.origin === location.origin && method === 'POST' && cpShouldInvalidateSettingsGet(url.pathname);
+    if (!endpoints.length && !invalidateSettingsGet) return rawFetch(input, init);
     var response = await rawFetch(input, init);
     if (response && response.ok) {
-      await cpNotifyInvalidate(rawFetch, input, init, endpoints, url.pathname);
+      if (endpoints.length) await cpNotifyInvalidate(rawFetch, input, init, endpoints, url.pathname);
+      if (invalidateSettingsGet) await cpInvalidateSettingsGet(rawFetch, input, init, url.pathname);
     }
     return response;
   }
@@ -1166,6 +1252,38 @@ ${fastRoutes}
 
   function sameJson(a, b) {
     return stableStringify(a) === stableStringify(b);
+  }
+
+  // SillyTavern refreshes characters[chid].json_data after /characters/get, but an already-open
+  // editor keeps its hidden json_data input. Keep that input aligned so edit patches use a fresh base.
+  function cpSyncCharacterEditorJsonData(avatar, jsonData) {
+    var expectedAvatar = String(avatar || '');
+    var text = String(jsonData || '');
+    if (!expectedAvatar || !text) return false;
+    var hidden = null;
+    var avatarPole = null;
+    try { hidden = document.querySelector('#character_json_data'); } catch (_) {}
+    try { avatarPole = document.querySelector('#avatar_url_pole'); } catch (_) {}
+    if (!hidden || !avatarPole) return false;
+    if (String(avatarPole.value || '') !== expectedAvatar) return false;
+    if (hidden.value !== text) hidden.value = text;
+    return true;
+  }
+
+  function cpScheduleCharacterEditorJsonSync(avatar, jsonData) {
+    var expectedAvatar = String(avatar || '');
+    var text = String(jsonData || '');
+    if (!expectedAvatar || !text) return;
+    var startedAt = Date.now();
+    var attempts = 0;
+    var attempt = function () {
+      attempts += 1;
+      if (cpSyncCharacterEditorJsonData(expectedAvatar, text)) return;
+      if (attempts < 20 && Date.now() - startedAt < 2000) {
+        try { setTimeout(attempt, 100); } catch (_) {}
+      }
+    };
+    attempt();
   }
 
   function decodeBodyToText(body) {
@@ -1932,6 +2050,7 @@ ${fastRoutes}
           state.settingsSave.optimized += 1;
           state.settingsSave.savedBytes += patch.savedBytes || 0;
           await updateSettingsBaseline(nextObject, 'settings-save-' + patch.mode);
+          await cpInvalidateSettingsGet(rawFetch, input, init, url.pathname);
           remember('settings.save.optimized', { mode: patch.mode, status: fastResponse.status, savedBytes: patch.savedBytes || 0, durationMs: Date.now() - startedAt });
           return fastResponse;
         }
@@ -1943,7 +2062,10 @@ ${fastRoutes}
 
     var fallbackResponse = await rawFetch(input, init);
     state.settingsSave.fallbacks += 1;
-    if (fallbackResponse && fallbackResponse.ok) await updateSettingsBaseline(nextObject, patch ? 'settings-save-fallback' : 'settings-save-original');
+    if (fallbackResponse && fallbackResponse.ok) {
+      await updateSettingsBaseline(nextObject, patch ? 'settings-save-fallback' : 'settings-save-original');
+      await cpInvalidateSettingsGet(rawFetch, input, init, url.pathname);
+    }
     remember('settings.save.original', { status: fallbackResponse && fallbackResponse.status, optimized: false, durationMs: Date.now() - startedAt });
     return fallbackResponse;
   }
@@ -1978,15 +2100,294 @@ ${fastRoutes}
       }
       var finalTotal = totalBytes || bytesReceived;
       cpUpdateRecentProgress(cpRecentTransferPatch('rendering', startedAt, bytesReceived, finalTotal, { status: response.status, percent: finalTotal ? 100 : null, etaMs: 0, message: '正在解析并渲染最近消息…' }));
-      return { body: new Blob(chunks), bytesReceived: bytesReceived, totalBytes: finalTotal || null };
+      var responseText = await new Response(new Blob(chunks)).text();
+      return { body: responseText, text: responseText, bytesReceived: bytesReceived, totalBytes: finalTotal || null };
     }
 
     var text = await response.text();
     bytesReceived = utf8Bytes(text || '');
     var fallbackTotal = totalBytes || bytesReceived;
     cpUpdateRecentProgress(cpRecentTransferPatch('rendering', startedAt, bytesReceived, fallbackTotal, { status: response.status, percent: fallbackTotal ? 100 : null, etaMs: 0, message: '正在解析并渲染最近消息…' }));
-    return { body: text, bytesReceived: bytesReceived, totalBytes: fallbackTotal || null };
+    return { body: text, text: text, bytesReceived: bytesReceived, totalBytes: fallbackTotal || null };
   }
+
+
+  function cpRecentPatchKey(bodyObject) {
+    try {
+      var clean = Object.assign({}, bodyObject || {});
+      delete clean.cpRecentPatch;
+      return stableStringify(clean);
+    } catch (_) {
+      return '{}';
+    }
+  }
+
+  function cpApplyRecentPatch(baseData, ops) {
+    var next = Array.isArray(baseData) ? baseData.slice() : [];
+    if (!Array.isArray(ops)) return next;
+    ops.forEach(function (op) {
+      if (!op || typeof op !== 'object') return;
+      if (op.op === 'set') {
+        var index = Number(op.index);
+        if (Number.isInteger(index) && index >= 0) next[index] = op.value;
+      } else if (op.op === 'splice') {
+        var spliceIndex = Math.max(0, Number(op.index) || 0);
+        var deleteCount = Math.max(0, Number(op.deleteCount) || 0);
+        var items = Array.isArray(op.items) ? op.items : [];
+        next.splice.apply(next, [spliceIndex, deleteCount].concat(items));
+      }
+    });
+    return next;
+  }
+
+  function cpRememberRecentBaseline(key, hash, data) {
+    if (!key || !hash || !Array.isArray(data)) return;
+    recentChatsPatchBaselines.set(key, { hash: hash, data: data });
+  }
+
+  function cpResolveRecentPatchedData(key, response, text) {
+    var mode = response.headers.get(HEADER_PREFIX + '-recent-patch') || 'full';
+    var hash = response.headers.get(HEADER_PREFIX + '-recent-hash') || '';
+    var baseline = recentChatsPatchBaselines.get(key);
+    var data = [];
+    if (mode === 'noop' && baseline && Array.isArray(baseline.data)) {
+      data = baseline.data;
+    } else if (mode === 'patch' && baseline && Array.isArray(baseline.data)) {
+      var patch = JSON.parse(text || '{}');
+      data = cpApplyRecentPatch(baseline.data, patch.ops);
+      hash = patch.nextHash || hash;
+    } else {
+      var parsed = JSON.parse(text || '[]');
+      data = Array.isArray(parsed) ? parsed : [];
+
+    }
+    if (hash) cpRememberRecentBaseline(key, hash, data);
+    return data;
+  }
+
+
+
+  function cpCharacterGetKey(bodyObject) {
+    try {
+      return String((bodyObject || {}).avatar_url || '');
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function cpSetAtPath(target, path, value) {
+    if (!Array.isArray(path) || path.length === 0) return value;
+    var parent = target;
+    for (var i = 0; i < path.length - 1; i++) {
+      var key = path[i];
+      var nextKey = path[i + 1];
+      if (parent[key] === null || typeof parent[key] !== 'object') parent[key] = typeof nextKey === 'number' ? [] : {};
+      parent = parent[key];
+    }
+    parent[path[path.length - 1]] = value;
+    return target;
+  }
+
+  function cpDeleteAtPath(target, path) {
+    if (!Array.isArray(path) || path.length === 0) return target;
+    var parent = target;
+    for (var i = 0; i < path.length - 1; i++) {
+      if (!parent || typeof parent !== 'object') return target;
+      parent = parent[path[i]];
+    }
+    if (parent && typeof parent === 'object') delete parent[path[path.length - 1]];
+    return target;
+  }
+
+  function cpApplyCharacterPatch(baseData, ops) {
+    var next = JSON.parse(JSON.stringify(baseData || {}));
+    if (!Array.isArray(ops)) return next;
+    ops.forEach(function (op) {
+      if (!op || typeof op !== 'object') return;
+      if (op.op === 'set') next = cpSetAtPath(next, op.path, op.value);
+      else if (op.op === 'delete') next = cpDeleteAtPath(next, op.path);
+    });
+    return next;
+  }
+
+  function cpRememberCharacterGetBaseline(key, hash, data) {
+    if (!key || !hash || !data || typeof data !== 'object') return;
+    characterGetPatchBaselines.set(key, { hash: hash, data: data });
+  }
+
+  function cpResolveCharacterGetPatchedData(key, response, text) {
+    var mode = response.headers.get(HEADER_PREFIX + '-character-get-patch') || 'full';
+    var hash = response.headers.get(HEADER_PREFIX + '-character-get-hash') || '';
+    var baseline = characterGetPatchBaselines.get(key);
+    var data;
+    if (mode === 'noop' && baseline && baseline.data) {
+      data = baseline.data;
+    } else if (mode === 'dedup') {
+      var dedup = JSON.parse(text || '{}');
+      var jsonData = String(dedup.json_data || '');
+      data = JSON.parse(jsonData || '{}');
+      if (data && typeof data === 'object') delete data.json_data;
+      data = cpApplyCharacterPatch(data, dedup.ops);
+      data.json_data = jsonData;
+      hash = dedup.hash || hash;
+    } else if (mode === 'patch' && baseline && baseline.data) {
+      var patch = JSON.parse(text || '{}');
+      data = cpApplyCharacterPatch(baseline.data, patch.ops);
+      hash = patch.nextHash || hash;
+    } else {
+      data = JSON.parse(text || '{}');
+    }
+    if (hash) cpRememberCharacterGetBaseline(key, hash, data);
+    return data;
+  }
+
+  async function handleCharacterGetFetch(rawFetch, input, init, url, method) {
+    if (!rawFetch || !url || method !== 'POST') return null;
+    try {
+      var probeText = await getBodyText(input, init, method);
+      var probeBody = {};
+      try { probeBody = probeText ? JSON.parse(probeText) : {}; } catch (_) { probeBody = {}; }
+      var headers = cloneHeaders(input, init);
+      if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+      var bodyText = probeText;
+      var bodyObject = probeBody;
+      var key = cpCharacterGetKey(bodyObject);
+      var baseline = key ? characterGetPatchBaselines.get(key) : null;
+      if (baseline && baseline.hash) bodyObject.cpCharacterGetPatch = { hash: baseline.hash };
+      var response = await rawFetch(PREFIX + '/fast/characters-get', { method: 'POST', headers: headers, credentials: (init && init.credentials) || 'same-origin', cache: 'no-store', redirect: 'manual', body: JSON.stringify(bodyObject || {}) });
+      if (!response || !response.ok || response.headers.get(HEADER_PREFIX + '-character-get-ready') !== '1') return response;
+      var text = await response.text();
+      var data = cpResolveCharacterGetPatchedData(key, response, text);
+      cpScheduleCharacterEditorJsonSync(key, data && data.json_data);
+      var responseHeaders = cpHeadersFromResponse(response);
+      try { responseHeaders.delete('content-length'); } catch (_) {}
+      remember('character.get.fast-response', { avatar: key, mode: response.headers.get(HEADER_PREFIX + '-character-get-patch') || 'full', status: response.status });
+      return new Response(JSON.stringify(data), { status: response.status, statusText: response.statusText || 'OK', headers: responseHeaders });
+    } catch (error) {
+      remember('character.get.fast-error', { error: String(error && error.message || error) });
+      return null;
+    }
+  }
+
+  function cpFormDataToPlainObject(formData) {
+    var out = {};
+    try {
+      formData.forEach(function (value, key) {
+        if (value instanceof File) {
+          if (value && value.size > 0 && value.name) out[key] = value;
+          return;
+        }
+        if (Object.prototype.hasOwnProperty.call(out, key)) {
+          if (!Array.isArray(out[key])) out[key] = [out[key]];
+          out[key].push(String(value));
+        } else {
+          out[key] = String(value);
+        }
+      });
+    } catch (_) {}
+    return out;
+  }
+
+  function cpTagsString(value) {
+    if (Array.isArray(value)) return value.join(', ');
+    return typeof value === 'string' ? value : '';
+  }
+
+  function cpCharacterEditBaseFields(raw, meta) {
+    raw = raw || {};
+    meta = meta || {};
+    var data = raw.data && typeof raw.data === 'object' ? raw.data : {};
+    var extensions = data.extensions && typeof data.extensions === 'object' ? data.extensions : {};
+    var depth = extensions.depth_prompt && typeof extensions.depth_prompt === 'object' ? extensions.depth_prompt : {};
+    return {
+      avatar_url: meta.avatar_url || raw.avatar || '',
+      ch_name: data.name ?? raw.name ?? '',
+      description: data.description ?? raw.description ?? '',
+      personality: data.personality ?? raw.personality ?? '',
+      scenario: data.scenario ?? raw.scenario ?? '',
+      first_mes: data.first_mes ?? raw.first_mes ?? '',
+      mes_example: data.mes_example ?? raw.mes_example ?? '',
+      creator_notes: data.creator_notes ?? raw.creatorcomment ?? '',
+      system_prompt: data.system_prompt ?? '',
+      post_history_instructions: data.post_history_instructions ?? '',
+      tags: cpTagsString(data.tags ?? raw.tags),
+      creator: data.creator ?? raw.creator ?? '',
+      character_version: data.character_version ?? raw.character_version ?? '',
+      alternate_greetings: Array.isArray(data.alternate_greetings) ? data.alternate_greetings.slice() : [],
+      talkativeness: String(extensions.talkativeness ?? raw.talkativeness ?? 0.5),
+      fav: String(Boolean(extensions.fav ?? raw.fav)),
+      world: extensions.world ?? '',
+      depth_prompt_prompt: depth.prompt ?? raw.depth_prompt_prompt ?? '',
+      depth_prompt_depth: String(depth.depth ?? raw.depth_prompt_depth ?? 4),
+      depth_prompt_role: depth.role ?? raw.depth_prompt_role ?? 'system',
+      chat: meta.chat ?? raw.chat ?? '',
+      create_date: meta.create_date ?? raw.create_date ?? '',
+      extensions: meta.extensions ?? '',
+    };
+  }
+
+  function cpMakeStringPatch(base, next) {
+    base = String(base ?? '');
+    next = String(next ?? '');
+    if (base === next) return null;
+    var prefix = 0;
+    var min = Math.min(base.length, next.length);
+    while (prefix < min && base[prefix] === next[prefix]) prefix++;
+    var suffix = 0;
+    while (suffix < min - prefix && base[base.length - 1 - suffix] === next[next.length - 1 - suffix]) suffix++;
+    var patch = { type: 'splice', start: prefix, deleteCount: base.length - prefix - suffix, insert: next.slice(prefix, next.length - suffix) };
+    var patchText = JSON.stringify(patch);
+    return patchText.length < next.length ? patch : { type: 'set', value: next };
+  }
+
+  async function handleCharacterEditFetch(rawFetch, input, init, url, method) {
+    if (!rawFetch || !url || method !== 'POST') return null;
+    try {
+      var formData = init && init.body instanceof FormData ? init.body : null;
+      if (!formData && input instanceof Request) {
+        try { formData = await input.clone().formData(); } catch (_) {}
+      }
+      if (!formData) return null;
+      var plain = cpFormDataToPlainObject(formData);
+      if (plain.avatar instanceof File) return null;
+      var rawJson = String(plain.json_data || '');
+      if (!rawJson || !plain.avatar_url) return null;
+      var raw = JSON.parse(rawJson);
+      var baseHash = await sha256Hex(rawJson);
+      var baseFields = cpCharacterEditBaseFields(raw, plain);
+      var payload = { avatar_url: String(plain.avatar_url), baseHash: baseHash, fields: {}, patches: {}, meta: { avatar_url: String(plain.avatar_url), chat: plain.chat || '', create_date: plain.create_date || '', extensions: plain.extensions || '' } };
+      Object.keys(plain).forEach(function (key) {
+        if (key === 'json_data' || key === 'avatar') return;
+        var nextValue = plain[key];
+        var baseValue = baseFields[key];
+        if (Array.isArray(nextValue) || Array.isArray(baseValue)) {
+          if (!sameJson(nextValue, baseValue)) payload.fields[key] = nextValue;
+          return;
+        }
+        if (String(nextValue ?? '') === String(baseValue ?? '')) return;
+        if (typeof nextValue === 'string' && typeof baseValue === 'string') payload.patches[key] = cpMakeStringPatch(baseValue, nextValue);
+        else payload.fields[key] = nextValue;
+      });
+      var headers = cloneHeaders(input, init);
+      headers.set('content-type', 'application/json');
+      headers.delete && headers.delete('content-encoding');
+      var fastResponse = await rawFetch(PREFIX + '/fast/characters-edit', { method: 'POST', headers: headers, credentials: (init && init.credentials) || 'same-origin', cache: 'no-store', redirect: 'manual', body: JSON.stringify(payload) });
+      if (fastResponse && fastResponse.ok) {
+        remember('character.edit.optimized', { avatar: plain.avatar_url, fields: Object.keys(payload.fields).length, patches: Object.keys(payload.patches).length });
+        characterGetPatchBaselines.delete(String(plain.avatar_url));
+        return fastResponse;
+      }
+      if (fastResponse && fastResponse.status === 409) remember('character.edit.stale-fallback', { avatar: plain.avatar_url });
+      return fastResponse;
+    } catch (error) {
+      remember('character.edit.fast-error', { error: String(error && error.message || error) });
+      return new Response(JSON.stringify({ ok: false, error: String(error && error.message || error) }), { status: 500, headers: { 'content-type': 'application/json' } });
+    }
+  }
+
+
+
+
 
   async function handleRecentChatsFetch(rawFetch, input, init, url, method) {
     if (!rawFetch || !url || method !== 'POST') return null;
@@ -1994,10 +2395,35 @@ ${fastRoutes}
     cpUpdateRecentProgress({ active: true, phase: 'requesting', startedAt: startedAt, bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, status: null, error: null, message: '等待 /recent 返回最近消息…' });
     remember('recent.fetch.start', { path: url.pathname });
     try {
-      var response = await rawFetch(input, init);
+      var headers = cloneHeaders(input, init);
+      if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+      var bodyText = await getBodyText(input, init, method);
+      var bodyObject = {};
+      try { bodyObject = bodyText ? JSON.parse(bodyText) : {}; } catch (_) { bodyObject = {}; }
+      var patchKey = cpRecentPatchKey(bodyObject);
+      var baseline = recentChatsPatchBaselines.get(patchKey);
+      if (baseline && baseline.hash) bodyObject.cpRecentPatch = { hash: baseline.hash };
+      var fastInit = {
+        method: 'POST',
+        headers: headers,
+        credentials: (init && init.credentials) || 'same-origin',
+        cache: 'no-store',
+        redirect: 'manual'
+      };
+      fastInit.body = JSON.stringify(bodyObject || {});
+      var response = await rawFetch(PREFIX + '/fast/recent-chats', fastInit);
       var read = await cpReadRecentResponseWithProgress(response, startedAt);
-      remember('recent.fetch.response', { path: url.pathname, status: response.status, bytesReceived: read.bytesReceived, totalBytes: read.totalBytes, durationMs: Date.now() - startedAt });
-      return new Response(read.body, { status: response.status, statusText: response.statusText || 'OK', headers: cpHeadersFromResponse(response) });
+      var recentData = cpResolveRecentPatchedData(patchKey, response, read.text);
+      var responseBody = JSON.stringify(recentData);
+      var expectedItems = null;
+      try {
+        if (Array.isArray(recentData)) expectedItems = recentData.length;
+      } catch (_) {}
+      cpUpdateRecentProgress({ phase: 'rendering', expectedItems: expectedItems, status: response.status, percent: read.totalBytes ? 100 : null, etaMs: 0, message: '正在解析并渲染最近消息…' });
+      remember('recent.fetch.response', { path: url.pathname, status: response.status, mode: response.headers.get(HEADER_PREFIX + '-recent-patch') || 'full', bytesReceived: read.bytesReceived, totalBytes: read.totalBytes, durationMs: Date.now() - startedAt });
+      var responseHeaders = cpHeadersFromResponse(response);
+      try { responseHeaders.delete('content-length'); } catch (_) {}
+      return new Response(responseBody, { status: response.status, statusText: response.statusText || 'OK', headers: responseHeaders });
     } catch (error) {
       cpFailRecentChatsProgress(error);
       remember('recent.fetch.error', { path: url.pathname, error: String(error && error.message || error), durationMs: Date.now() - startedAt });
@@ -2077,6 +2503,14 @@ ${fastRoutes}
       if (url && url.origin === location.origin && url.pathname === SETTINGS_GET.originalPath && method === SETTINGS_GET.method) {
         var settingsGetResponse = await handleSettingsGetFetch(rawFetch, input, init, url, method);
         if (settingsGetResponse) return settingsGetResponse;
+      }
+      if (url && url.origin === location.origin && url.pathname === '/api/characters/get' && method === 'POST') {
+        var characterGetResponse = await handleCharacterGetFetch(rawFetch, input, init, url, method);
+        if (characterGetResponse) return characterGetResponse;
+      }
+      if (url && url.origin === location.origin && url.pathname === '/api/characters/edit' && method === 'POST') {
+        var characterEditResponse = await handleCharacterEditFetch(rawFetch, input, init, url, method);
+        if (characterEditResponse) return characterEditResponse;
       }
       if (url && url.origin === location.origin && (url.pathname === CHAT_SAVE.originalGetPath || url.pathname === CHAT_SAVE.originalGroupGetPath) && method === CHAT_SAVE.method) {
         var chatGetResponse = await handleChatGetFetch(rawFetch, input, init, url, method);

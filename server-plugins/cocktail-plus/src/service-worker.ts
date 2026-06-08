@@ -409,10 +409,10 @@ async function fetchFast(event, fastPath) {
         status: response.status,
         progress: originalPath === '/api/characters/all' ? {
           cache: cacheState,
-          phase: cacheState === 'ASYNC-MISS' ? 'requesting' : 'downloading',
+          phase: (cacheState === 'ASYNC-MISS' || cacheState === 'STALE-SIGNATURE') ? 'requesting' : 'downloading',
           status: response.status,
         } : null,
-        shouldPollStatus: originalPath === '/api/characters/all' && cacheState === 'ASYNC-MISS',
+        shouldPollStatus: originalPath === '/api/characters/all' && (cacheState === 'ASYNC-MISS' || cacheState === 'STALE-SIGNATURE'),
         durationMs: Date.now() - startedAt,
       });
       return response;

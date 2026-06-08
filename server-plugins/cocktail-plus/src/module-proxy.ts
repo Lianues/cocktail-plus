@@ -304,18 +304,22 @@ function patchWelcomeScreenJs(source) {
     out = out.replace(
         /([ \t]*)const\s+recentChats\s*=\s*await\s+getRecentChats\(\)\s*;\s*\r?\n\1const\s+chatAfterFetch\s*=\s*getCurrentChatId\(\)\s*;\s*\r?\n\1if\s*\(chatAfterFetch\s*!==\s*currentChatId\)\s*\{\s*\r?\n\1[ \t]*console\.debug\('Chat changed while fetching recent chats\.'\);\s*\r?\n\1[ \t]*return;\s*\r?\n\1\}\s*\r?\n\s*\r?\n\1if\s*\(chatAfterFetch\s*===\s*undefined\s*&&\s*force\)\s*\{\s*\r?\n\1[ \t]*console\.debug\('Forcing welcome screen open\.'\);\s*\r?\n\1[ \t]*chat\.splice\(0,\s*chat\.length\);\s*\r?\n\1[ \t]*\$\('#chat'\)\.empty\(\);\s*\r?\n\1\}\s*\r?\n\s*\r?\n\1await\s+sendWelcomePanel\(recentChats,\s*expand\)\s*;\s*\r?\n\1await\s+unshallowPermanentAssistant\(\)\s*;\s*\r?\n\1sendAssistantMessage\(\)\s*;\s*\r?\n\1sendWelcomePrompt\(\)\s*;/,
         (_match, indent) => [
+            `${indent}const cpExistingWelcomePanel = document.querySelector('#chat .welcomePanel');`,
             `${indent}globalThis.__cocktailPlusEarlyBridge?.startRecentChatsProgress?.();`,
             `${indent}const recentChatsPromise = getRecentChats();`,
-            `${indent}if (currentChatId === undefined && force) {`,
+            `${indent}if (currentChatId === undefined && force && !cpExistingWelcomePanel) {`,
             `${indent}    console.debug('Forcing welcome screen open.');`,
             `${indent}    chat.splice(0, chat.length);`,
             `${indent}    $('#chat').empty();`,
             `${indent}}`,
             `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('welcome.skeleton-before');`,
+            `${indent}if (!cpExistingWelcomePanel) {`,
             `${indent}await sendWelcomePanel([], expand);`,
+            `${indent}}`,
             `${indent}globalThis.__cocktailPlusEarlyBridge?.updateRecentChatsProgress?.({ phase: 'requesting', message: '等待 /recent 返回最近消息…' });`,
             `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('welcome.skeleton-after');`,
             `${indent}void recentChatsPromise.then(async (recentChats) => {`,
+            `${indent}    let cpRecentChats = recentChats;`,
             `${indent}    const chatAfterFetch = getCurrentChatId();`,
             `${indent}    if (chatAfterFetch !== currentChatId) {`,
             `${indent}        console.debug('Chat changed while fetching recent chats.');`,
@@ -323,19 +327,108 @@ function patchWelcomeScreenJs(source) {
             `${indent}        return;`,
             `${indent}    }`,
             `${indent}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('welcome.recent-before');`,
-            `${indent}    await sendWelcomePanel(recentChats, expand);`,
+            `${indent}    await sendWelcomePanel(cpRecentChats, expand);`,
             `${indent}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('welcome.recent-after');`,
             `${indent}    globalThis.__cocktailPlusEarlyBridge?.finishRecentChatsProgress?.('rendered');`,
             `${indent}}).catch(error => {`,
             `${indent}    globalThis.__cocktailPlusEarlyBridge?.failRecentChatsProgress?.(error);`,
             `${indent}    console.error('Welcome recent chats error:', error);`,
             `${indent}});`,
+            `${indent}if (!cpExistingWelcomePanel) {`,
             `${indent}void (async () => {`,
             `${indent}    await unshallowPermanentAssistant();`,
             `${indent}    sendAssistantMessage();`,
             `${indent}    sendWelcomePrompt();`,
             `${indent}})().catch(error => console.error('Welcome assistant error:', error));`,
+            `${indent}}`,
         ].join('\n'),
+    );
+    out = out.replace(
+        /([ \t]*)const\s+data\s*=\s*await\s+response\.json\(\)\s*;\s*\r?\n/,
+        (_match, indent) => [
+            `${indent}const data = await response.json();`,
+            `${indent}if (response.headers?.get?.('x-cocktail-plus-recent-ready') === '1') {`,
+            `${indent}    globalThis.__cocktailPlusEarlyBridge && (globalThis.__cocktailPlusEarlyBridge.recentChatsData = Array.isArray(data) ? data : []);`,
+            `${indent}    return Array.isArray(data) ? data : [];`,
+            `${indent}}`,
+        ].join('\n') + '\n',
+    );
+    if (!out.includes('function cpEnsureRecentCharacterEntity')) {
+        out = out.replace(
+            /(\/\*\*\s*\r?\n\s*\* Opens a recent character chat\.)/,
+            `function cpRecentChatElement(match) {
+    try {
+        return Array.from(document.querySelectorAll('.recentChat')).find(el => {
+            if (!el || typeof el.getAttribute !== 'function') return false;
+            if (match.avatarId && el.getAttribute('data-avatar') === match.avatarId) return true;
+            if (match.groupId && el.getAttribute('data-group') === match.groupId) return true;
+            return false;
+        }) || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function cpRecentDisplayName(match, fallback) {
+    const element = cpRecentChatElement(match);
+    const name = element?.querySelector?.('.characterName')?.textContent?.trim();
+    const row = cpRecentData(match);
+    return name || row?.char_name || fallback || '';
+}
+
+function cpRecentData(match) {
+    const rows = globalThis.__cocktailPlusEarlyBridge?.recentChatsData;
+    if (!Array.isArray(rows)) return null;
+    return rows.find(row => {
+        if (!row) return false;
+        if (match.avatarId && row.avatar === match.avatarId && (!match.fileName || row.chat_name === match.fileName || row.file_name === match.fileName + '.jsonl')) return true;
+        if (match.groupId && row.group === match.groupId && (!match.fileName || row.chat_name === match.fileName || row.file_name === match.fileName + '.jsonl')) return true;
+        return false;
+    }) || null;
+}
+
+function cpEnsureRecentCharacterEntity(avatarId, fileName) {
+    let characterId = characters.findIndex(x => x.avatar === avatarId);
+    if (characterId === -1 && avatarId) {
+        const name = cpRecentDisplayName({ avatarId, fileName }, String(avatarId).replace(/\\.png$/i, ''));
+        characters.push({
+            shallow: true,
+            name,
+            avatar: avatarId,
+            chat: fileName,
+            fav: false,
+            tags: [],
+            data: { name, tags: [], extensions: { fav: false } },
+        });
+        characterId = characters.length - 1;
+    }
+    if (characterId !== -1 && fileName) characters[characterId].chat = fileName;
+    return characterId;
+}
+
+function cpEnsureRecentGroupEntity(groupId, fileName) {
+    let group = groups.find(x => x.id === groupId);
+    if (!group && groupId) {
+        const row = cpRecentData({ groupId, fileName });
+        const chats = Array.isArray(row?.group_chats) && row.group_chats.length ? row.group_chats.slice() : (fileName ? [fileName] : []);
+        group = { id: groupId, name: cpRecentDisplayName({ groupId, fileName }, groupId), chat_id: fileName || row?.chat_name || '', chats, members: Array.isArray(row?.group_members) ? row.group_members.slice() : [], disabled_members: Array.isArray(row?.group_disabled_members) ? row.group_disabled_members.slice() : [], avatar_url: row?.group_avatar_url || '' };
+        groups.push(group);
+    }
+    if (group && fileName && Array.isArray(group.chats) && !group.chats.includes(fileName)) group.chats.push(fileName);
+    if (group && fileName && !group.chat_id) group.chat_id = fileName;
+    return group;
+}
+
+$1`,
+        );
+    }
+    out = out.replaceAll(
+        `const characterId = characters.findIndex(x => x.avatar === avatarId);`,
+        `const characterId = cpEnsureRecentCharacterEntity(avatarId, fileName);`,
+    );
+    out = out.replaceAll(
+        `const group = groups.find(x => x.id === groupId);`,
+        `const group = cpEnsureRecentGroupEntity(groupId, typeof fileName !== 'undefined' ? fileName : undefined);`,
     );
     out = out.replace(
         /([ \t]*)chatElement\.append\(fragment\.firstChild\);/,

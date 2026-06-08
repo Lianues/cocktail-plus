@@ -29,11 +29,17 @@ export async function refreshEntry(ctx, endpointKey, reason = 'refresh') {
         stats.refreshes++;
         updateProgress({ phase: 'starting', reason, startedAt, bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, status: null, error: null });
         const signature = endpoint.getSignature(ctx);
-        const result = await fetchOriginal(ctx, endpoint, { onProgress: updateProgress });
+        let result = null;
+        if (typeof endpoint.fetchForCache === 'function') {
+            result = await endpoint.fetchForCache(ctx, config, { onProgress: updateProgress, startedAt, reason });
+        }
+        if (!result) result = await fetchOriginal(ctx, endpoint, { onProgress: updateProgress });
         if (result.ok && result.status >= 200 && result.status < 300) {
             const now = Date.now();
             updateProgress({ phase: 'transforming', status: result.status, bytesReceived: result.bytesReceived ?? Buffer.byteLength(result.bodyText || '', 'utf8'), totalBytes: result.totalBytes ?? null, etaMs: 0 });
-            const transformed = endpoint.transformBodyForCache
+            const transformed = result.transform
+                ? { bodyText: result.bodyText, ...result.transform }
+                : endpoint.transformBodyForCache
                 ? endpoint.transformBodyForCache(ctx, result.bodyText, config)
                 : defaultTransformBodyForCache(result.bodyText);
             const entry = {
@@ -52,6 +58,8 @@ export async function refreshEntry(ctx, endpointKey, reason = 'refresh') {
                     cachedBytes: transformed.cachedBytes,
                     count: transformed.count,
                     error: transformed.error,
+                    direct: transformed.direct,
+                    errors: transformed.errors,
                 },
                 hitCount: 0,
                 staleHitCount: 0,
@@ -160,12 +168,13 @@ export async function handleFast(req, res, endpointKey) {
             memoryCache.set(cacheKey, entry);
             return sendEntry(res, entry, 'HIT');
         }
-        if (config.staleWhileRevalidate && signatureMatches) {
+        if (config.staleWhileRevalidate && (signatureMatches || endpoint.staleOnSignatureChange)) {
             stats.staleHits++;
             entry.staleHitCount = Number(entry.staleHitCount || 0) + 1;
             memoryCache.set(cacheKey, entry);
-            const state = 'STALE';
-            void refreshEntry(ctx, endpointKey, 'max-stale-expired').catch(() => {});
+            const state = signatureMatches ? 'STALE' : 'STALE-SIGNATURE';
+            const reason = signatureMatches ? 'max-stale-expired' : 'signature-changed';
+            void refreshEntry(ctx, endpointKey, reason).catch(() => {});
             return sendEntry(res, entry, state);
         }
     }
