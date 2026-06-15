@@ -6,6 +6,7 @@ set -u
 PLUGIN_ID="cocktail-plus"
 SELECTED_CONFIG=""
 SELECTED_ROOT=""
+SELECTED_VERSION=""
 BACKEND_UPDATE_NOTICE_CURRENT=""
 BACKEND_UPDATE_NOTICE_REMOTE=""
 BACKEND_UPDATE_NOTICE_SOURCE=""
@@ -67,7 +68,14 @@ set_selected_config() {
   fi
   SELECTED_CONFIG="$cfg"
   SELECTED_ROOT="$(dirname "$cfg")"
+  SELECTED_VERSION=""
+  refresh_selected_sillytavern_version || true
   say_ok "当前 SillyTavern: $SELECTED_ROOT"
+  if [ -n "$SELECTED_VERSION" ]; then
+    printf 'SillyTavern 版本: %s\n' "$SELECTED_VERSION"
+  else
+    say_warn 'SillyTavern 版本: 未能从 package.json 读取'
+  fi
   printf 'config.yaml: %s\n' "$SELECTED_CONFIG"
   warn_termux_environment_aliases "$SELECTED_ROOT"
   start_backend_update_check >/dev/null 2>&1 || true
@@ -254,6 +262,13 @@ find_configs_by_scan() {
   } | unique_lines
 }
 
+sillytavern_version_for_display() {
+  local root="$1" version
+  version="$(get_sillytavern_package_version "$root" 2>/dev/null || true)"
+  [ -n "$version" ] || version='未知'
+  printf '%s\n' "$version"
+}
+
 select_config_from_list() {
   local raw_configs=() configs=()
   while IFS= read -r cfg; do
@@ -272,8 +287,11 @@ select_config_from_list() {
 
   if [ "${#configs[@]}" -eq 0 ]; then return 1; fi
   if [ "${#configs[@]}" -eq 1 ]; then
-    printf '找到 SillyTavern：%s\n' "$(dirname "${configs[0]}")" >&2
-    local yes=''
+    local root version yes=''
+    root="$(dirname "${configs[0]}")"
+    version="$(sillytavern_version_for_display "$root")"
+    printf '找到 SillyTavern：%s\n' "$root" >&2
+    printf 'SillyTavern 版本：%s\n' "$version" >&2
     if [ -r /dev/tty ]; then
       printf '使用这个目录？(Y/n) ' >/dev/tty
       read -r yes </dev/tty || yes=''
@@ -289,9 +307,12 @@ select_config_from_list() {
   fi
 
   printf '\n找到多个候选 config.yaml：\n' >&2
-  local i
+  local i root version
   for ((i=0; i<${#configs[@]}; i++)); do
-    printf '[%d] %s\n' "$((i+1))" "${configs[$i]}" >&2
+    root="$(dirname "${configs[$i]}")"
+    version="$(sillytavern_version_for_display "$root")"
+    printf '[%d] %s（SillyTavern 版本：%s）\n' "$((i+1))" "$root" "$version" >&2
+    printf '    config.yaml: %s\n' "${configs[$i]}" >&2
   done
   local choice=''
   if [ -r /dev/tty ]; then
@@ -688,11 +709,228 @@ NODE
   say_ok 'index.html 已恢复，cocktail-plus Early Bridge 注入已移除。'
 }
 
+strip_outer_quotes() {
+  printf '%s' "$1" | sed -E "s/^[[:space:]]+|[[:space:]]+$//g; s/^[\"']//; s/[\"']$//"
+}
+
+get_sillytavern_package_version() {
+  local root="${1:-$SELECTED_ROOT}" pkg version
+  [ -n "$root" ] || { say_warn '未选择 SillyTavern 目录' >&2; return 1; }
+  pkg="$root/package.json"
+  [ -f "$pkg" ] || { say_warn "找不到 package.json：$pkg" >&2; return 1; }
+
+  version=""
+  if command -v node >/dev/null 2>&1; then
+    version="$(node - "$pkg" <<'NODE' 2>/dev/null || true
+const fs = require('fs');
+const pkgPath = process.argv[2];
+try {
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  const version = String(pkg.version || '').trim();
+  if (version) process.stdout.write(version);
+} catch (e) {}
+NODE
+)"
+  fi
+
+  if [ -z "$version" ]; then
+    version="$(sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$pkg" | head -n 1)"
+  fi
+
+  [ -n "$version" ] || { say_warn "无法从 package.json 读取 SillyTavern 版本：$pkg" >&2; return 1; }
+  printf '%s\n' "$version"
+}
+
+refresh_selected_sillytavern_version() {
+  SELECTED_VERSION=""
+  [ -n "$SELECTED_ROOT" ] || return 1
+  SELECTED_VERSION="$(get_sillytavern_package_version "$SELECTED_ROOT" 2>/dev/null || true)"
+  [ -n "$SELECTED_VERSION" ]
+}
+
+selected_sillytavern_version() {
+  if [ -z "$SELECTED_VERSION" ]; then
+    refresh_selected_sillytavern_version || true
+  fi
+  if [ -z "$SELECTED_VERSION" ]; then
+    say_warn "无法从 package.json 读取 SillyTavern 版本：$SELECTED_ROOT/package.json" >&2
+    return 1
+  fi
+  printf '%s\n' "$SELECTED_VERSION"
+}
+
+is_probably_sillytavern_index_html() {
+  local file="$1"
+  [ -s "$file" ] || return 1
+  grep -Eiq '<!doctype[[:space:]]+html|<html([[:space:]>]|$)' "$file" || return 1
+  grep -Eiq 'scripts/i18n\.js|script\.js' "$file" || return 1
+}
+
+replace_sillytavern_index_html_from_file() {
+  local source label skip_confirm target source_abs target_abs backup confirm base
+  source="$(strip_outer_quotes "$1")"
+  label="${2:-本地文件}"
+  skip_confirm="${3:-}"
+
+  ensure_config_selected || return 1
+  [ -f "$source" ] || { say_warn "index.html 来源文件不存在：$source"; return 1; }
+
+  target="$SELECTED_ROOT/public/index.html"
+  [ -f "$target" ] || { say_warn "目标 public/index.html 不存在：$target"; return 1; }
+
+  source_abs="$(abs_path "$source")"
+  target_abs="$(abs_path "$target")"
+  if [ "$source_abs" = "$target_abs" ]; then
+    say_warn '来源文件和目标 public/index.html 是同一个文件，已取消。'
+    return 1
+  fi
+
+  if ! is_probably_sillytavern_index_html "$source"; then
+    say_warn '选择/下载的文件看起来不像 SillyTavern public/index.html。'
+    [ "$skip_confirm" = "--skip-confirm" ] && return 1
+    read -r -p '仍然继续替换？(y/N) ' confirm
+    if ! [[ "$confirm" =~ ^[Yy] ]]; then say_warn '已取消'; return 0; fi
+  fi
+
+  printf '来源（%s）：%s\n' "$label" "$source"
+  printf '目标：%s\n' "$target"
+  if [ "$skip_confirm" != "--skip-confirm" ]; then
+    read -r -p '确认备份并替换目标 public/index.html？(y/N) ' confirm
+    if ! [[ "$confirm" =~ ^[Yy] ]]; then say_warn '已取消'; return 0; fi
+  fi
+
+  backup="$(backup_file "$target")" || { say_warn '备份原 index.html 失败，已取消替换。'; return 1; }
+  cp -f "$source" "$target" || { say_warn "替换 public/index.html 失败：$target"; return 1; }
+  [ -n "$backup" ] && printf '已备份原 index.html：%s\n' "$backup"
+  say_ok 'public/index.html 已替换。'
+  say_warn '请重启 SillyTavern，或刷新浏览器页面并清理缓存后再检查。'
+}
+
+select_index_html_with_file_manager() {
+  local chosen="" kernel
+  kernel="$(uname -s 2>/dev/null || true)"
+
+  if [ "$kernel" = "Darwin" ] && command -v osascript >/dev/null 2>&1; then
+    chosen="$(osascript <<'OSA' 2>/dev/null || true
+try
+  POSIX path of (choose file with prompt "请选择用于替换的 index.html" of type {"html"})
+on error
+  return ""
+end try
+OSA
+)"
+  fi
+
+  if [ -z "$chosen" ] && command -v zenity >/dev/null 2>&1; then
+    chosen="$(zenity --file-selection --title='请选择用于替换的 index.html' --file-filter='index.html | index.html' --file-filter='HTML 文件 | *.html' 2>/dev/null || true)"
+  fi
+
+  if [ -z "$chosen" ] && command -v kdialog >/dev/null 2>&1; then
+    chosen="$(kdialog --title '请选择用于替换的 index.html' --getopenfilename "${HOME:-/}" 'HTML 文件 (*.html)' 2>/dev/null || true)"
+  fi
+
+  if [ -z "$chosen" ] && command -v yad >/dev/null 2>&1; then
+    chosen="$(yad --file-selection --title='请选择用于替换的 index.html' --file-filter='HTML 文件 | *.html' 2>/dev/null || true)"
+  fi
+
+  printf '%s\n' "$chosen"
+}
+
+select_index_html_replacement() {
+  ensure_config_selected || return 1
+  say_title '选择本地 index.html 替换当前酒馆 public/index.html'
+  local source base confirm
+  source="$(select_index_html_with_file_manager || true)"
+  if [ -z "$source" ]; then
+    say_warn '未通过系统文件管理器选择文件。'
+    read -r -p '可手动输入 index.html 路径，或直接回车取消: ' source
+    [ -n "$source" ] || { say_warn '已取消'; return 0; }
+  fi
+
+  source="$(strip_outer_quotes "$source")"
+  base="$(basename "$source")"
+  if [ "$base" != "index.html" ]; then
+    say_warn "选择的文件名不是 index.html：$base"
+    read -r -p '仍然继续？(y/N) ' confirm
+    if ! [[ "$confirm" =~ ^[Yy] ]]; then say_warn '已取消'; return 0; fi
+  fi
+
+  replace_sillytavern_index_html_from_file "$source" '本地选择的 index.html'
+}
+
+download_file_to_path() {
+  local url="$1" dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 10 --max-time 30 -A 'cocktail-plus-helper' -o "$dest" "$url" 2>/dev/null && return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=30 --tries=1 --user-agent='cocktail-plus-helper' -O "$dest" "$url" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+download_sillytavern_index_html_replacement() {
+  ensure_config_selected || return 1
+  say_title '从 GitHub/镜像站下载原版 index.html 并替换'
+  local version target confirm tmp name url
+  version="$(selected_sillytavern_version)" || return 1
+  target="$SELECTED_ROOT/public/index.html"
+  printf '当前酒馆版本（来自 package.json）：%s\n' "$version"
+  printf '目标：%s\n' "$target"
+  read -r -p '确认下载同版本原版 index.html 并替换？(y/N) ' confirm
+  if ! [[ "$confirm" =~ ^[Yy] ]]; then say_warn '已取消'; return 0; fi
+
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    say_warn '找不到 curl 或 wget，无法下载 index.html。'
+    return 1
+  fi
+
+  tmp="${TMPDIR:-/tmp}/sillytavern-index-$version-$$.html"
+  while IFS='|' read -r name url; do
+    [ -n "$name" ] || continue
+    rm -f "$tmp"
+    say_info "下载：$name - $url"
+    if download_file_to_path "$url" "$tmp"; then
+      if is_probably_sillytavern_index_html "$tmp"; then
+        replace_sillytavern_index_html_from_file "$tmp" "$name / SillyTavern $version" --skip-confirm
+        local rc=$?
+        rm -f "$tmp"
+        return "$rc"
+      fi
+      say_warn "$name 下载内容不像 SillyTavern index.html，继续尝试下一个来源。"
+    else
+      say_warn "$name 下载失败，继续尝试下一个来源。"
+    fi
+  done <<EOF
+GitHub Raw|https://raw.githubusercontent.com/SillyTavern/SillyTavern/$version/public/index.html
+GitHub raw 路径|https://github.com/SillyTavern/SillyTavern/raw/$version/public/index.html
+jsDelivr 镜像|https://cdn.jsdelivr.net/gh/SillyTavern/SillyTavern@$version/public/index.html
+Fastly jsDelivr 镜像|https://fastly.jsdelivr.net/gh/SillyTavern/SillyTavern@$version/public/index.html
+gh.llkk.cc 镜像|https://gh.llkk.cc/https://raw.githubusercontent.com/SillyTavern/SillyTavern/$version/public/index.html
+ghproxy.net 镜像|https://ghproxy.net/https://raw.githubusercontent.com/SillyTavern/SillyTavern/$version/public/index.html
+EOF
+
+  rm -f "$tmp"
+  say_warn '所有 GitHub/镜像站 index.html 下载来源都失败。'
+  return 1
+}
+
 repair_backend_uninstall_black_screen() {
   ensure_config_selected || return 1
   say_title '修复卸载后端扩展后启动立马黑屏问题'
-  restore_cocktail_plus_index_html --no-backup
-  say_ok '已直接修复 index.html：移除 Early Bridge 注入，并恢复 i18n.js/script.js module 脚本。'
+  printf '[1] 自动修复当前 public/index.html（原方式：移除 cocktail-plus 注入并恢复脚本）\n'
+  printf '[2] 使用系统文件管理器选择 index.html 并替换当前酒馆 public/index.html\n'
+  printf '[3] 从 GitHub/镜像站下载当前酒馆版本的原版 index.html 并替换\n'
+  printf '[0] 返回\n'
+  local choice
+  read -r -p '请选择: ' choice
+  case "$choice" in
+    1) restore_cocktail_plus_index_html --no-backup; say_ok '已直接修复 index.html：移除 Early Bridge 注入，并恢复 i18n.js/script.js module 脚本。' ;;
+    2) select_index_html_replacement ;;
+    3) download_sillytavern_index_html_replacement ;;
+    0) return 0 ;;
+    *) say_warn '无效选项。' ;;
+  esac
 }
 
 
@@ -1368,6 +1606,12 @@ show_current_selection() {
   say_title '当前选择'
   if [ -n "$SELECTED_CONFIG" ]; then
     printf 'SillyTavern: %s\n' "$SELECTED_ROOT"
+    if [ -z "$SELECTED_VERSION" ]; then refresh_selected_sillytavern_version || true; fi
+    if [ -n "$SELECTED_VERSION" ]; then
+      printf 'SillyTavern 版本: %s\n' "$SELECTED_VERSION"
+    else
+      say_warn 'SillyTavern 版本: 未能从 package.json 读取'
+    fi
     printf 'config.yaml: %s\n' "$SELECTED_CONFIG"
     printf 'dataRoot: %s\n' "$(resolve_data_root "$SELECTED_ROOT" "$SELECTED_CONFIG")"
   else
@@ -1395,7 +1639,7 @@ show_menu() {
   printf '[2] 手动输入 SillyTavern/config.yaml（酒馆配置文件）路径\n'
   printf '[3] 安装/重新安装 cocktail-plus 后端扩展，会自动开启酒馆使用后端扩展权限\n'
   printf '[4] 卸载 cocktail-plus 后端扩展（恢复 index.html）\n'
-  printf '[5] 修复卸载后端扩展后启动立马黑屏问题\n'
+  printf '[5] 修复卸载后端扩展后启动立马黑屏问题（自动/本地替换/GitHub下载）\n'
   printf '[6] 允许酒馆使用后端扩展\n'
   printf '[7] 禁止酒馆使用后端扩展\n'
   printf '[8] 修改 cocktail-plus 后端插件配置项\n'

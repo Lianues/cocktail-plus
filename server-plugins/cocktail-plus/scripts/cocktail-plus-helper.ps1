@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $PluginId = 'cocktail-plus'
 $Script:SelectedConfigPath = $null
 $Script:SelectedRoot = $null
+$Script:SelectedVersion = $null
 $Script:BackendUpdateNotice = $null
 $Script:BackendUpdateCheckError = $null
 $Script:BackendUpdateCheckJob = $null
@@ -56,7 +57,15 @@ function Set-SelectedConfig([string]$ConfigPath) {
     }
     $Script:SelectedConfigPath = $full
     $Script:SelectedRoot = Split-Path -Parent $full
+    $Script:SelectedVersion = $null
+    try { [void](Refresh-SelectedSillyTavernVersion) } catch {}
+
     Write-Ok "当前 SillyTavern: $Script:SelectedRoot"
+    if (-not [string]::IsNullOrWhiteSpace($Script:SelectedVersion)) {
+        Write-Host "SillyTavern 版本: $Script:SelectedVersion"
+    } else {
+        Write-Warn 'SillyTavern 版本: 未能从 package.json 读取'
+    }
     Write-Host "config.yaml: $Script:SelectedConfigPath"
     try { Start-BackendUpdateCheck } catch {}
 }
@@ -163,11 +172,22 @@ function Find-SillyTavernConfigsByScan {
     return @($configs)
 }
 
+function Get-SillyTavernVersionDisplay([string]$Root) {
+    try {
+        $version = Get-SillyTavernPackageVersion $Root
+        if (-not [string]::IsNullOrWhiteSpace($version)) { return $version }
+    } catch {}
+    return '未知'
+}
+
 function Select-ConfigFromList([string[]]$Configs) {
     $valid = @($Configs | Where-Object { Test-SillyTavernConfig $_ } | Select-Object -Unique)
     if ($valid.Count -eq 0) { return $null }
     if ($valid.Count -eq 1) {
-        Write-Host "找到 SillyTavern：$((Split-Path -Parent $valid[0]))"
+        $root = Split-Path -Parent $valid[0]
+        $version = Get-SillyTavernVersionDisplay $root
+        Write-Host "找到 SillyTavern：$root"
+        Write-Host "SillyTavern 版本：$version"
         $yes = Read-Host "使用这个目录？(Y/n)"
         if ([string]::IsNullOrWhiteSpace($yes) -or $yes.Trim().ToLower() -in @('y', 'yes')) { return $valid[0] }
         return $null
@@ -176,7 +196,10 @@ function Select-ConfigFromList([string[]]$Configs) {
     Write-Host ''
     Write-Host '找到多个候选 config.yaml：' -ForegroundColor Green
     for ($i = 0; $i -lt $valid.Count; $i++) {
-        Write-Host "[$($i + 1)] $($valid[$i])"
+        $root = Split-Path -Parent $valid[$i]
+        $version = Get-SillyTavernVersionDisplay $root
+        Write-Host "[$($i + 1)] $root（SillyTavern 版本：$version）"
+        Write-Host "    config.yaml: $($valid[$i])"
     }
     $choice = Read-Host '请输入编号，或直接回车取消'
     if ([string]::IsNullOrWhiteSpace($choice)) { return $null }
@@ -532,11 +555,220 @@ function Restore-CocktailPlusIndexHtml {
     Write-Ok 'index.html 已恢复，cocktail-plus Early Bridge 注入已移除。'
 }
 
+function Get-SillyTavernPackageVersion {
+    param([string]$Root = $Script:SelectedRoot)
+    if ([string]::IsNullOrWhiteSpace($Root)) { throw '未选择 SillyTavern 目录' }
+    $packagePath = Join-Path $Root 'package.json'
+    if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) { throw "找不到 package.json：$packagePath" }
+
+    try {
+        $pkg = Get-Content -LiteralPath $packagePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $version = [string]$pkg.version
+        if (-not [string]::IsNullOrWhiteSpace($version)) { return $version.Trim() }
+    } catch {}
+
+    try {
+        $text = Get-Content -LiteralPath $packagePath -Raw -Encoding UTF8
+        if ($text -match '"version"\s*:\s*"([^"]+)"') { return $Matches[1].Trim() }
+    } catch {}
+
+    throw "无法从 package.json 读取 SillyTavern 版本：$packagePath"
+}
+
+function Refresh-SelectedSillyTavernVersion {
+    $Script:SelectedVersion = $null
+    if ([string]::IsNullOrWhiteSpace($Script:SelectedRoot)) { return $null }
+    try {
+        $Script:SelectedVersion = Get-SillyTavernPackageVersion $Script:SelectedRoot
+    } catch {
+        $Script:SelectedVersion = $null
+    }
+    return $Script:SelectedVersion
+}
+
+function Get-SelectedSillyTavernVersion {
+    Ensure-ConfigSelected
+    if ([string]::IsNullOrWhiteSpace($Script:SelectedVersion)) {
+        [void](Refresh-SelectedSillyTavernVersion)
+    }
+    if ([string]::IsNullOrWhiteSpace($Script:SelectedVersion)) { throw "无法从 package.json 读取 SillyTavern 版本：$(Join-Path $Script:SelectedRoot 'package.json')" }
+    return $Script:SelectedVersion
+}
+
+function Test-SillyTavernIndexHtmlContent([string]$Html) {
+    if ([string]::IsNullOrWhiteSpace($Html)) { return $false }
+    $looksHtml = $Html -match '(?is)<!doctype\s+html|<html\b'
+    $looksSillyTavern = $Html -match '(?i)scripts/i18n\.js|\bscript\.js\b'
+    return ($looksHtml -and $looksSillyTavern)
+}
+
+function Test-SillyTavernIndexHtmlFile([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $html = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        return (Test-SillyTavernIndexHtmlContent $html)
+    } catch {
+        return $false
+    }
+}
+
+function Read-YesNo([string]$Prompt, [bool]$DefaultYes = $false) {
+    $answer = Read-Host $Prompt
+    if ([string]::IsNullOrWhiteSpace($answer)) { return $DefaultYes }
+    return ($answer.Trim().ToLower() -in @('y', 'yes'))
+}
+
+function Select-IndexHtmlWithSystemDialog {
+    $dialog = $null
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Title = '请选择用于替换的 index.html'
+        $dialog.Filter = 'index.html|index.html|HTML 文件 (*.html)|*.html|所有文件 (*.*)|*.*'
+        $dialog.FileName = 'index.html'
+        $dialog.CheckFileExists = $true
+        $dialog.Multiselect = $false
+        if ($env:USERPROFILE) {
+            $downloads = Join-Path $env:USERPROFILE 'Downloads'
+            if (Test-Path -LiteralPath $downloads -PathType Container) { $dialog.InitialDirectory = $downloads }
+        }
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $dialog.FileName }
+    } catch {
+        Write-Warn "系统文件选择器打开失败：$($_.Exception.Message)"
+    } finally {
+        if ($dialog) { $dialog.Dispose() }
+    }
+    return $null
+}
+
+function Replace-SillyTavernIndexHtmlFromFile {
+    param(
+        [Parameter(Mandatory=$true)][string]$SourcePath,
+        [string]$SourceLabel = '本地文件',
+        [switch]$SkipConfirm
+    )
+
+    Ensure-ConfigSelected
+    $source = Get-FullPathSafe ($SourcePath.Trim().Trim('"').Trim("'"))
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "index.html 来源文件不存在：$source" }
+
+    $target = Join-Path $Script:SelectedRoot 'public\index.html'
+    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "目标 public/index.html 不存在：$target" }
+
+    $sourceFull = Get-FullPathSafe $source
+    $targetFull = Get-FullPathSafe $target
+    if ([string]::Equals($sourceFull, $targetFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Warn '来源文件和目标 public/index.html 是同一个文件，已取消。'
+        return $false
+    }
+
+    if (-not (Test-SillyTavernIndexHtmlFile $source)) {
+        Write-Warn '选择/下载的文件看起来不像 SillyTavern public/index.html。'
+        if ($SkipConfirm) { return $false }
+        if (-not (Read-YesNo '仍然继续替换？(y/N)' $false)) { Write-Warn '已取消'; return $false }
+    }
+
+    Write-Host "来源（$SourceLabel）：$source"
+    Write-Host "目标：$target"
+    if (-not $SkipConfirm) {
+        if (-not (Read-YesNo '确认备份并替换目标 public/index.html？(y/N)' $false)) { Write-Warn '已取消'; return $false }
+    }
+
+    $backup = Backup-File $target
+    Copy-Item -LiteralPath $source -Destination $target -Force
+    if ($backup) { Write-Host "已备份原 index.html：$backup" }
+    Write-Ok 'public/index.html 已替换。'
+    Write-Warn '请重启 SillyTavern，或刷新浏览器页面并清理缓存后再检查。'
+    return $true
+}
+
+function Invoke-SelectIndexHtmlReplacement {
+    Ensure-ConfigSelected
+    Write-Title '选择本地 index.html 替换当前酒馆 public/index.html'
+    $source = Select-IndexHtmlWithSystemDialog
+    if ([string]::IsNullOrWhiteSpace($source)) {
+        Write-Warn '未通过系统文件管理器选择文件。'
+        $source = Read-Host '可手动输入 index.html 路径，或直接回车取消'
+        if ([string]::IsNullOrWhiteSpace($source)) { Write-Warn '已取消'; return }
+    }
+
+    $fileName = [System.IO.Path]::GetFileName($source.Trim().Trim('"').Trim("'"))
+    if ($fileName -ne 'index.html') {
+        Write-Warn "选择的文件名不是 index.html：$fileName"
+        if (-not (Read-YesNo '仍然继续？(y/N)' $false)) { Write-Warn '已取消'; return }
+    }
+
+    [void](Replace-SillyTavernIndexHtmlFromFile -SourcePath $source -SourceLabel '本地选择的 index.html')
+}
+
+function Get-SillyTavernIndexHtmlDownloadSources([string]$Version) {
+    $raw = "https://raw.githubusercontent.com/SillyTavern/SillyTavern/$Version/public/index.html"
+    return @(
+        [pscustomobject]@{ Name='GitHub Raw'; Url=$raw },
+        [pscustomobject]@{ Name='GitHub raw 路径'; Url="https://github.com/SillyTavern/SillyTavern/raw/$Version/public/index.html" },
+        [pscustomobject]@{ Name='jsDelivr 镜像'; Url="https://cdn.jsdelivr.net/gh/SillyTavern/SillyTavern@$Version/public/index.html" },
+        [pscustomobject]@{ Name='Fastly jsDelivr 镜像'; Url="https://fastly.jsdelivr.net/gh/SillyTavern/SillyTavern@$Version/public/index.html" },
+        [pscustomobject]@{ Name='gh.llkk.cc 镜像'; Url="https://gh.llkk.cc/https://raw.githubusercontent.com/SillyTavern/SillyTavern/$Version/public/index.html" },
+        [pscustomobject]@{ Name='ghproxy.net 镜像'; Url="https://ghproxy.net/https://raw.githubusercontent.com/SillyTavern/SillyTavern/$Version/public/index.html" }
+    )
+}
+
+function Invoke-DownloadSillyTavernIndexHtmlReplacement {
+    Ensure-ConfigSelected
+    Write-Title '从 GitHub/镜像站下载原版 index.html 并替换'
+    $version = Get-SelectedSillyTavernVersion
+    Write-Host "当前酒馆版本（来自 package.json）：$version"
+    Write-Host "目标：$(Join-Path $Script:SelectedRoot 'public\index.html')"
+    if (-not (Read-YesNo '确认下载同版本原版 index.html 并替换？(y/N)' $false)) { Write-Warn '已取消'; return }
+
+    $temp = Join-Path ([System.IO.Path]::GetTempPath()) ("sillytavern-index-$version-" + [System.Guid]::NewGuid().ToString('N') + '.html')
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+    foreach ($source in (Get-SillyTavernIndexHtmlDownloadSources $version)) {
+        try {
+            if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }
+            Write-Info "下载：$($source.Name) - $($source.Url)"
+            $params = @{
+                Uri = $source.Url
+                OutFile = $temp
+                TimeoutSec = 30
+                Headers = @{ 'User-Agent' = 'cocktail-plus-helper' }
+                ErrorAction = 'Stop'
+            }
+            if ($PSVersionTable.PSVersion.Major -lt 6) { $params['UseBasicParsing'] = $true }
+            Invoke-WebRequest @params
+
+            if (-not (Test-SillyTavernIndexHtmlFile $temp)) {
+                Write-Warn "$($source.Name) 下载内容不像 SillyTavern index.html，继续尝试下一个来源。"
+                continue
+            }
+
+            $ok = Replace-SillyTavernIndexHtmlFromFile -SourcePath $temp -SourceLabel "$($source.Name) / SillyTavern $version" -SkipConfirm
+            if ($ok) { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }; return }
+        } catch {
+            Write-Warn "$($source.Name) 下载失败：$($_.Exception.Message)"
+        }
+    }
+
+    if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }
+    throw '所有 GitHub/镜像站 index.html 下载来源都失败。'
+}
+
 function Repair-BackendUninstallBlackScreen {
     Ensure-ConfigSelected
     Write-Title '修复卸载后端扩展后启动立马黑屏问题'
-    Restore-CocktailPlusIndexHtml -NoBackup
-    Write-Ok '已直接修复 index.html：移除 Early Bridge 注入，并恢复 i18n.js/script.js module 脚本。'
+    Write-Host '[1] 自动修复当前 public/index.html（原方式：移除 cocktail-plus 注入并恢复脚本）'
+    Write-Host '[2] 使用系统文件管理器选择 index.html 并替换当前酒馆 public/index.html'
+    Write-Host '[3] 从 GitHub/镜像站下载当前酒馆版本的原版 index.html 并替换'
+    Write-Host '[0] 返回'
+    $choice = Read-Host '请选择'
+    switch ($choice.Trim()) {
+        '1' { Restore-CocktailPlusIndexHtml -NoBackup; Write-Ok '已直接修复 index.html：移除 Early Bridge 注入，并恢复 i18n.js/script.js module 脚本。' }
+        '2' { Invoke-SelectIndexHtmlReplacement }
+        '3' { Invoke-DownloadSillyTavernIndexHtmlReplacement }
+        '0' { return }
+        default { Write-Warn '无效选项。' }
+    }
 }
 
 
@@ -1274,7 +1506,13 @@ if (Test-Path -LiteralPath '$startBatLiteral') {
 function Show-CurrentSelection {
     Write-Title '当前选择'
     if ($Script:SelectedConfigPath) {
+        if ([string]::IsNullOrWhiteSpace($Script:SelectedVersion)) { [void](Refresh-SelectedSillyTavernVersion) }
         Write-Host "SillyTavern: $Script:SelectedRoot"
+        if (-not [string]::IsNullOrWhiteSpace($Script:SelectedVersion)) {
+            Write-Host "SillyTavern 版本: $Script:SelectedVersion"
+        } else {
+            Write-Warn 'SillyTavern 版本: 未能从 package.json 读取'
+        }
         Write-Host "config.yaml: $Script:SelectedConfigPath"
         Write-Host "dataRoot: $(Resolve-DataRoot $Script:SelectedRoot $Script:SelectedConfigPath)"
     } else {
@@ -1302,7 +1540,7 @@ function Show-Menu {
     Write-Host '[2] 手动输入 SillyTavern/config.yaml（酒馆配置文件）路径'
     Write-Host '[3] 安装/重新安装 cocktail-plus 后端扩展，会自动开启酒馆使用后端扩展权限'
     Write-Host '[4] 卸载 cocktail-plus 后端扩展（恢复 index.html）'
-    Write-Host '[5] 修复卸载后端扩展后启动立马黑屏问题'
+    Write-Host '[5] 修复卸载后端扩展后启动立马黑屏问题（自动/本地替换/GitHub下载）'
     Write-Host '[6] 允许酒馆使用后端扩展'
     Write-Host '[7] 禁止酒馆使用后端扩展'
     Write-Host '[8] 修改 cocktail-plus 后端插件配置项'
