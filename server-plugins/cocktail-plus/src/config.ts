@@ -18,8 +18,13 @@ export const DEFAULT_CONFIG = Object.freeze({
     diskCacheVersion: true,
     fastVersionOnMiss: true,
     // If there is no characters cache yet, don't block the frontend on the huge original response.
-    // Return [] immediately and build the shallow cache in background.
+    // Default is fast mode: return [] immediately, build shallow cache in background, then refresh from the frontend.
     asyncCharactersAllOnMiss: true,
+    // Compatibility guard for the empty fast response. Set false to wait for a real shallow list on first no-cache load.
+    // Auto-load chat is guarded by the module proxy so active_character is not cleared while cache is building.
+    allowEmptyCharactersAllOnMiss: true,
+    // New explicit opt-in for the slow but strict first load. Legacy asyncCharactersAllOnMiss=false in preserved config.json is ignored unless this is true.
+    blockCharactersAllOnMiss: false,
     // Install a tiny bridge script into public/index.html. It runs before script.js and can patch fetch on first page load.
     earlyBridgeEnabled: true,
     autoInstallEarlyBridge: true,
@@ -47,8 +52,8 @@ export const DEFAULT_CONFIG = Object.freeze({
     templatePreloadEnabled: true,
     // Prefetch /version early so script.js can reuse the fast response. Static resource preloads are intentionally not handled here.
     startupPreloadEnabled: true,
-    // Optional Service Worker fallbacks. Early Bridge remains the primary path; these are disabled by default for explicit opt-in.
-    serviceWorkerFastRouteFallback: false,
+    // Service Worker fallback for fast startup routes stays on so old pages still avoid blocking if Early Bridge misses.
+    serviceWorkerFastRouteFallback: true,
     serviceWorkerSettingsGetFallback: false,
     serviceWorkerSettingsSaveFallback: false,
     serviceWorkerChatSaveFallback: false,
@@ -60,6 +65,10 @@ export const DEFAULT_CONFIG = Object.freeze({
     patchSystemMessagesInit: true,
     patchExtensionManifests: true,
     patchParallelActivateExtensions: true,
+    // Fast-start mode: extension scripts/styles activate after APP_READY. Event replay keeps common extension hooks compatible.
+    deferExtensionActivationUntilAppReady: true,
+    // Capture browser console/error/rejection logs through Early Bridge and expose them from the backend plugin panel/API.
+    browserLogCaptureEnabled: true,
     // Optional ST source hotfix. When enabled, plugin patches src/endpoints/chats.js on startup;
     // a restart is still required for the patched source to be loaded by SillyTavern.
     autoPatchChatsEnoentGuard: false,
@@ -96,7 +105,10 @@ export function normalizeConfig(input = {}) {
     out.diskCacheCharactersAll = asBool(input.diskCacheCharactersAll, DEFAULT_CONFIG.diskCacheCharactersAll);
     out.diskCacheVersion = asBool(input.diskCacheVersion, DEFAULT_CONFIG.diskCacheVersion);
     out.fastVersionOnMiss = asBool(input.fastVersionOnMiss, DEFAULT_CONFIG.fastVersionOnMiss);
-    out.asyncCharactersAllOnMiss = asBool(input.asyncCharactersAllOnMiss, DEFAULT_CONFIG.asyncCharactersAllOnMiss);
+    out.blockCharactersAllOnMiss = asBool(input.blockCharactersAllOnMiss, DEFAULT_CONFIG.blockCharactersAllOnMiss);
+    // Preserve fast first paint even when older deployments kept 0.1.20's slow config.json values.
+    out.asyncCharactersAllOnMiss = out.blockCharactersAllOnMiss ? false : true;
+    out.allowEmptyCharactersAllOnMiss = out.blockCharactersAllOnMiss ? false : true;
     out.earlyBridgeEnabled = asBool(input.earlyBridgeEnabled, DEFAULT_CONFIG.earlyBridgeEnabled);
     out.autoInstallEarlyBridge = asBool(input.autoInstallEarlyBridge, DEFAULT_CONFIG.autoInstallEarlyBridge);
     out.earlyBridgePatchFetch = asBool(input.earlyBridgePatchFetch, DEFAULT_CONFIG.earlyBridgePatchFetch);
@@ -115,7 +127,8 @@ export function normalizeConfig(input = {}) {
     out.cacheSettingsGet = asBool(input.cacheSettingsGet, DEFAULT_CONFIG.cacheSettingsGet);
     out.templatePreloadEnabled = asBool(input.templatePreloadEnabled, DEFAULT_CONFIG.templatePreloadEnabled);
     out.startupPreloadEnabled = asBool(input.startupPreloadEnabled, DEFAULT_CONFIG.startupPreloadEnabled);
-    out.serviceWorkerFastRouteFallback = asBool(input.serviceWorkerFastRouteFallback, DEFAULT_CONFIG.serviceWorkerFastRouteFallback);
+    // Keep SW fallback on by default and migrate old false values to fast mode; Early Bridge remains primary.
+    out.serviceWorkerFastRouteFallback = true;
     out.serviceWorkerSettingsGetFallback = asBool(input.serviceWorkerSettingsGetFallback, DEFAULT_CONFIG.serviceWorkerSettingsGetFallback);
     out.serviceWorkerSettingsSaveFallback = asBool(input.serviceWorkerSettingsSaveFallback, DEFAULT_CONFIG.serviceWorkerSettingsSaveFallback);
     out.serviceWorkerChatSaveFallback = asBool(input.serviceWorkerChatSaveFallback, DEFAULT_CONFIG.serviceWorkerChatSaveFallback);
@@ -126,6 +139,8 @@ export function normalizeConfig(input = {}) {
     out.patchSystemMessagesInit = asBool(input.patchSystemMessagesInit, DEFAULT_CONFIG.patchSystemMessagesInit);
     out.patchExtensionManifests = asBool(input.patchExtensionManifests, DEFAULT_CONFIG.patchExtensionManifests);
     out.patchParallelActivateExtensions = asBool(input.patchParallelActivateExtensions, DEFAULT_CONFIG.patchParallelActivateExtensions);
+    out.deferExtensionActivationUntilAppReady = asBool(input.deferExtensionActivationUntilAppReady, DEFAULT_CONFIG.deferExtensionActivationUntilAppReady);
+    out.browserLogCaptureEnabled = asBool(input.browserLogCaptureEnabled, DEFAULT_CONFIG.browserLogCaptureEnabled);
     out.autoPatchChatsEnoentGuard = asBool(input.autoPatchChatsEnoentGuard, DEFAULT_CONFIG.autoPatchChatsEnoentGuard);
     return out;
 }

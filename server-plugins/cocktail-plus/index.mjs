@@ -22,7 +22,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.19";
+  return "0.1.20";
 }
 var VERSION = readVersion();
 var info = {
@@ -49,8 +49,13 @@ var DEFAULT_CONFIG = Object.freeze({
   diskCacheVersion: true,
   fastVersionOnMiss: true,
   // If there is no characters cache yet, don't block the frontend on the huge original response.
-  // Return [] immediately and build the shallow cache in background.
+  // Default is fast mode: return [] immediately, build shallow cache in background, then refresh from the frontend.
   asyncCharactersAllOnMiss: true,
+  // Compatibility guard for the empty fast response. Set false to wait for a real shallow list on first no-cache load.
+  // Auto-load chat is guarded by the module proxy so active_character is not cleared while cache is building.
+  allowEmptyCharactersAllOnMiss: true,
+  // New explicit opt-in for the slow but strict first load. Legacy asyncCharactersAllOnMiss=false in preserved config.json is ignored unless this is true.
+  blockCharactersAllOnMiss: false,
   // Install a tiny bridge script into public/index.html. It runs before script.js and can patch fetch on first page load.
   earlyBridgeEnabled: true,
   autoInstallEarlyBridge: true,
@@ -78,8 +83,8 @@ var DEFAULT_CONFIG = Object.freeze({
   templatePreloadEnabled: true,
   // Prefetch /version early so script.js can reuse the fast response. Static resource preloads are intentionally not handled here.
   startupPreloadEnabled: true,
-  // Optional Service Worker fallbacks. Early Bridge remains the primary path; these are disabled by default for explicit opt-in.
-  serviceWorkerFastRouteFallback: false,
+  // Service Worker fallback for fast startup routes stays on so old pages still avoid blocking if Early Bridge misses.
+  serviceWorkerFastRouteFallback: true,
   serviceWorkerSettingsGetFallback: false,
   serviceWorkerSettingsSaveFallback: false,
   serviceWorkerChatSaveFallback: false,
@@ -91,6 +96,10 @@ var DEFAULT_CONFIG = Object.freeze({
   patchSystemMessagesInit: true,
   patchExtensionManifests: true,
   patchParallelActivateExtensions: true,
+  // Fast-start mode: extension scripts/styles activate after APP_READY. Event replay keeps common extension hooks compatible.
+  deferExtensionActivationUntilAppReady: true,
+  // Capture browser console/error/rejection logs through Early Bridge and expose them from the backend plugin panel/API.
+  browserLogCaptureEnabled: true,
   // Optional ST source hotfix. When enabled, plugin patches src/endpoints/chats.js on startup;
   // a restart is still required for the patched source to be loaded by SillyTavern.
   autoPatchChatsEnoentGuard: false
@@ -124,7 +133,9 @@ function normalizeConfig(input = {}) {
   out.diskCacheCharactersAll = asBool(input.diskCacheCharactersAll, DEFAULT_CONFIG.diskCacheCharactersAll);
   out.diskCacheVersion = asBool(input.diskCacheVersion, DEFAULT_CONFIG.diskCacheVersion);
   out.fastVersionOnMiss = asBool(input.fastVersionOnMiss, DEFAULT_CONFIG.fastVersionOnMiss);
-  out.asyncCharactersAllOnMiss = asBool(input.asyncCharactersAllOnMiss, DEFAULT_CONFIG.asyncCharactersAllOnMiss);
+  out.blockCharactersAllOnMiss = asBool(input.blockCharactersAllOnMiss, DEFAULT_CONFIG.blockCharactersAllOnMiss);
+  out.asyncCharactersAllOnMiss = out.blockCharactersAllOnMiss ? false : true;
+  out.allowEmptyCharactersAllOnMiss = out.blockCharactersAllOnMiss ? false : true;
   out.earlyBridgeEnabled = asBool(input.earlyBridgeEnabled, DEFAULT_CONFIG.earlyBridgeEnabled);
   out.autoInstallEarlyBridge = asBool(input.autoInstallEarlyBridge, DEFAULT_CONFIG.autoInstallEarlyBridge);
   out.earlyBridgePatchFetch = asBool(input.earlyBridgePatchFetch, DEFAULT_CONFIG.earlyBridgePatchFetch);
@@ -143,7 +154,7 @@ function normalizeConfig(input = {}) {
   out.cacheSettingsGet = asBool(input.cacheSettingsGet, DEFAULT_CONFIG.cacheSettingsGet);
   out.templatePreloadEnabled = asBool(input.templatePreloadEnabled, DEFAULT_CONFIG.templatePreloadEnabled);
   out.startupPreloadEnabled = asBool(input.startupPreloadEnabled, DEFAULT_CONFIG.startupPreloadEnabled);
-  out.serviceWorkerFastRouteFallback = asBool(input.serviceWorkerFastRouteFallback, DEFAULT_CONFIG.serviceWorkerFastRouteFallback);
+  out.serviceWorkerFastRouteFallback = true;
   out.serviceWorkerSettingsGetFallback = asBool(input.serviceWorkerSettingsGetFallback, DEFAULT_CONFIG.serviceWorkerSettingsGetFallback);
   out.serviceWorkerSettingsSaveFallback = asBool(input.serviceWorkerSettingsSaveFallback, DEFAULT_CONFIG.serviceWorkerSettingsSaveFallback);
   out.serviceWorkerChatSaveFallback = asBool(input.serviceWorkerChatSaveFallback, DEFAULT_CONFIG.serviceWorkerChatSaveFallback);
@@ -154,6 +165,8 @@ function normalizeConfig(input = {}) {
   out.patchSystemMessagesInit = asBool(input.patchSystemMessagesInit, DEFAULT_CONFIG.patchSystemMessagesInit);
   out.patchExtensionManifests = asBool(input.patchExtensionManifests, DEFAULT_CONFIG.patchExtensionManifests);
   out.patchParallelActivateExtensions = asBool(input.patchParallelActivateExtensions, DEFAULT_CONFIG.patchParallelActivateExtensions);
+  out.deferExtensionActivationUntilAppReady = asBool(input.deferExtensionActivationUntilAppReady, DEFAULT_CONFIG.deferExtensionActivationUntilAppReady);
+  out.browserLogCaptureEnabled = asBool(input.browserLogCaptureEnabled, DEFAULT_CONFIG.browserLogCaptureEnabled);
   out.autoPatchChatsEnoentGuard = asBool(input.autoPatchChatsEnoentGuard, DEFAULT_CONFIG.autoPatchChatsEnoentGuard);
   return out;
 }
@@ -213,8 +226,8 @@ function scanDirectoryShallow(dirPath, options = {}) {
   if (!dirPath) return out;
   const exts = Array.isArray(options.extensions) ? options.extensions.map((x) => String(x).toLowerCase()) : null;
   try {
-    const entries = fs3.readdirSync(dirPath, { withFileTypes: true });
-    for (const entry of entries) {
+    const entries2 = fs3.readdirSync(dirPath, { withFileTypes: true });
+    for (const entry of entries2) {
       if (entry.name.startsWith(".")) continue;
       const ext = path2.extname(entry.name).toLowerCase();
       if (entry.isFile() && exts && !exts.includes(ext)) continue;
@@ -504,7 +517,7 @@ function transformBodyForCache(ctx, bodyText, config2) {
   }
 }
 function makeAsyncMiss(ctx, signature, config2) {
-  if (!config2.asyncCharactersAllOnMiss) return null;
+  if (!config2.asyncCharactersAllOnMiss || !config2.allowEmptyCharactersAllOnMiss) return null;
   return {
     state: "ASYNC-MISS",
     status: 200,
@@ -2281,6 +2294,11 @@ ${fastRoutes}
     maxPatchBytesRatio: ${JSON.stringify(config.chatSaveMaxPatchBytesRatio)},
     maxBaselines: ${JSON.stringify(config.chatSaveCacheMaxEntries)}
   };
+  var BROWSER_LOGS = {
+    enabled: ${JSON.stringify(!!config.browserLogCaptureEnabled)},
+    ingestPath: PREFIX + '/browser-logs/ingest',
+    beaconPath: PREFIX + '/browser-logs/beacon'
+  };
   var FLAG = '__cocktailPlusEarlyBridge';
   var state = window[FLAG] = window[FLAG] || { version: VERSION, installedAt: Date.now(), events: [], patchedFetch: false, swRegisterStarted: false, settingsSave: { baselineHash: '', captures: 0, optimized: 0, fallbacks: 0, savedBytes: 0 }, chatSave: { baselineCount: 0, captures: 0, optimized: 0, fallbacks: 0, savedBytes: 0, evictions: 0 } };
   state.settingsSave = state.settingsSave || { baselineHash: '', captures: 0, optimized: 0, fallbacks: 0, savedBytes: 0 };
@@ -2817,15 +2835,173 @@ ${fastRoutes}
   var fastGetPrefetches = new Map();
   var extensionDiscoverPrefetch = null;
   var extensionManifestPrefetches = new Map();
+  var extensionResourcePreloads = new Set();
+  var charactersAllWarmPrefetch = null;
   var backgroundsAllPrefetch = null;
   var groupsAllPrefetch = null;
+
+  function cpShouldPrintEarlyEvent(type) {
+    var text = String(type || '');
+    return /(?:error|throw|failed|not-proxied|disabled|browser-log.capture-installed|fetch.patch-disabled|module.main-entry-not-proxied)/i.test(text);
+  }
 
   function remember(type, detail) {
     var item = { t: Date.now(), type: type, detail: detail || {} };
     state.events.push(item);
     if (state.events.length > 100) state.events.shift();
-    try { console.info('[cocktail-plus:early] ' + type, detail || ''); } catch (_) {}
+    if (cpShouldPrintEarlyEvent(type)) {
+      try { console.info('[cocktail-plus:early] ' + type, detail || ''); } catch (_) {}
+    }
     try { window.dispatchEvent(new CustomEvent('cocktail-plus:early', { detail: item })); } catch (_) {}
+  }
+
+  function cpClipLogText(value, max) {
+    var text = String(value === undefined ? 'undefined' : value === null ? 'null' : value);
+    var limit = max || 3000;
+    return text.length > limit ? text.slice(0, limit) + '\u2026<truncated ' + (text.length - limit) + '>' : text;
+  }
+
+  function cpSerializeLogArg(value) {
+    try {
+      if (value instanceof Error) return cpClipLogText((value.name || 'Error') + ': ' + (value.message || '') + '\\n' + (value.stack || ''));
+      if (typeof value === 'string') return cpClipLogText(value);
+      if (value === undefined) return 'undefined';
+      if (value === null) return 'null';
+      if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+      return cpClipLogText(JSON.stringify(value));
+    } catch (_) {
+      try { return cpClipLogText(Object.prototype.toString.call(value)); } catch (_) { return '[unserializable]'; }
+    }
+  }
+
+  function cpSendBrowserLogBeacon(entry) {
+    try {
+      if (!BROWSER_LOGS.enabled || !BROWSER_LOGS.beaconPath) return;
+      var payload = {
+        level: cpClipLogText(entry && entry.level || 'log', 40),
+        message: cpClipLogText(entry && entry.message || (entry && entry.args ? entry.args.join(' ') : ''), 900),
+        args: Array.isArray(entry && entry.args) ? entry.args.slice(0, 4).map(function (x) { return cpClipLogText(x, 700); }) : [],
+        stack: cpClipLogText(entry && entry.stack || '', 1000),
+        pageUrl: location.href,
+        source: cpClipLogText(entry && entry.source || 'early-beacon', 200),
+        line: entry && entry.line || null,
+        column: entry && entry.column || null,
+        timestamp: entry && entry.timestamp || Date.now(),
+      };
+      var json = JSON.stringify(payload);
+      if (json.length > 1800) {
+        payload.args = [];
+        payload.stack = cpClipLogText(payload.stack, 300);
+        payload.message = cpClipLogText(payload.message, 700);
+        json = JSON.stringify(payload);
+      }
+      var url = BROWSER_LOGS.beaconPath + '?t=' + Date.now() + '&d=' + encodeURIComponent(json);
+      if (url.length > 3900) {
+        url = BROWSER_LOGS.beaconPath + '?t=' + Date.now() + '&level=' + encodeURIComponent(payload.level) + '&message=' + encodeURIComponent(cpClipLogText(payload.message, 1200));
+      }
+      var img = new Image();
+      img.referrerPolicy = 'no-referrer-when-downgrade';
+      img.src = url;
+    } catch (_) {}
+  }
+
+  function cpInstallBrowserLogCapture() {
+    if (!BROWSER_LOGS.enabled || state.browserLogCaptureInstalled) return;
+    state.browserLogCaptureInstalled = true;
+    state.browserLogQueue = state.browserLogQueue || [];
+    state.browserLogSending = false;
+    state.browserLogFlushTimer = null;
+    state.browserLogSeq = state.browserLogSeq || 1;
+    var rawConsole = {};
+    ['debug', 'log', 'info', 'warn', 'error', 'trace'].forEach(function (level) {
+      try { rawConsole[level] = console[level] && console[level].bind(console); } catch (_) {}
+    });
+
+    function enqueue(level, argsLike, extra) {
+      try {
+        var args = Array.prototype.slice.call(argsLike || []).map(cpSerializeLogArg);
+        var message = args.join(' ');
+        if (message.indexOf('[cocktail-plus:browser-log-send]') !== -1) return;
+        if (message.indexOf('[cocktail-plus:early]') === 0 && !/(error|warn|failed|not-proxied|browser-log)/i.test(message)) return;
+        if (message.indexOf('[cocktail-plus:route-diag]') === 0 || message.indexOf('[cocktail-plus:module-diag]') === 0 || message.indexOf('[cocktail-plus:fast-diag]') === 0) return;
+        var entry = Object.assign({
+          seq: state.browserLogSeq++,
+          level: level,
+          args: args,
+          message: cpClipLogText(message),
+          stack: '',
+          pageUrl: location.href,
+          userAgent: navigator.userAgent,
+          timestamp: Date.now(),
+        }, extra || {});
+        state.browserLogQueue.push(entry);
+        while (state.browserLogQueue.length > 300) state.browserLogQueue.shift();
+        if (level === 'warn' || level === 'error' || level === 'window-error' || level === 'unhandledrejection') {
+          cpSendBrowserLogBeacon(entry);
+        }
+        scheduleFlush();
+      } catch (_) {}
+    }
+
+    function scheduleFlush() {
+      if (state.browserLogFlushTimer) return;
+      state.browserLogFlushTimer = setTimeout(function () {
+        state.browserLogFlushTimer = null;
+        flush();
+      }, 800);
+    }
+
+    function getLogHeaders() {
+      var headers = new Headers();
+      headers.set('content-type', 'application/json');
+      headers.set(HEADER_PREFIX + '-early', VERSION);
+      if (settingsGetCsrfToken) headers.set('x-csrf-token', settingsGetCsrfToken);
+      return headers;
+    }
+
+    async function flush() {
+      if (state.browserLogSending || !state.browserLogQueue.length) return;
+      if (!settingsGetCsrfToken) { scheduleFlush(); return; }
+      var fetcher = state.rawFetch || (typeof window.fetch === 'function' ? window.fetch.bind(window) : null);
+      if (!fetcher) { scheduleFlush(); return; }
+      state.browserLogSending = true;
+      var batch = state.browserLogQueue.splice(0, 80);
+      try {
+        await fetcher(BROWSER_LOGS.ingestPath, {
+          method: 'POST',
+          headers: getLogHeaders(),
+          credentials: 'same-origin',
+          cache: 'no-store',
+          body: JSON.stringify({ entries: batch }),
+        });
+      } catch (_) {
+        state.browserLogQueue = batch.concat(state.browserLogQueue).slice(-300);
+      } finally {
+        state.browserLogSending = false;
+        if (state.browserLogQueue.length) scheduleFlush();
+      }
+    }
+
+    ['debug', 'log', 'info', 'warn', 'error', 'trace'].forEach(function (level) {
+      try {
+        var raw = rawConsole[level];
+        if (typeof raw !== 'function') return;
+        console[level] = function cpConsoleCapture() {
+          try { raw.apply(console, arguments); } catch (_) {}
+          enqueue(level, arguments);
+        };
+      } catch (_) {}
+    });
+
+    window.addEventListener('error', function (event) {
+      enqueue('window-error', [event.message || 'window error'], { source: event.filename || '', line: event.lineno || null, column: event.colno || null, stack: event.error && event.error.stack || '' });
+    });
+    window.addEventListener('unhandledrejection', function (event) {
+      var reason = event.reason;
+      enqueue('unhandledrejection', [reason && reason.message ? reason.message : reason], { stack: reason && reason.stack || '' });
+    });
+    state.flushBrowserLogs = flush;
+    remember('browser-log.capture-installed', { enabled: true });
   }
 
   state.startupMarks = state.startupMarks || [];
@@ -3430,6 +3606,64 @@ ${fastRoutes}
     } catch (_) { return ''; }
   }
 
+  function extensionAssetPathForName(name, asset) {
+    try {
+      if (!name || typeof name !== 'string' || !asset || typeof asset !== 'string') return '';
+      var raw = String(asset || '').trim();
+      if (!raw) return '';
+      var protocolIndex = raw.indexOf('://');
+      if (raw.indexOf('//') === 0 || protocolIndex > 0) return '';
+      if (raw.charAt(0) === '/') return raw;
+      var encodedName = name.split('/').map(encodeURIComponent).join('/');
+      var encodedAsset = raw.split('/').map(encodeURIComponent).join('/');
+      return '/scripts/extensions/' + encodedName + '/' + encodedAsset;
+    } catch (_) { return ''; }
+  }
+
+  function addExtensionResourcePreload(href, rel, asValue) {
+    try {
+      if (!href || extensionResourcePreloads.has(rel + ':' + href)) return;
+      extensionResourcePreloads.add(rel + ':' + href);
+      if (document.querySelectorAll) {
+        var existing = document.querySelectorAll('link[data-cocktail-plus-extension-preload]');
+        for (var i = 0; i < existing.length; i++) {
+          try {
+            if (existing[i] && existing[i].href === new URL(href, location.href).href) return;
+          } catch (_) {
+            if (existing[i] && existing[i].getAttribute && existing[i].getAttribute('href') === href) return;
+          }
+        }
+      }
+      var link = document.createElement('link');
+      link.rel = rel;
+      if (asValue) link.as = asValue;
+      link.href = href;
+      link.dataset.cocktailPlusExtensionPreload = '1';
+      (document.head || document.documentElement).appendChild(link);
+      remember('extensions.resource-preload', { rel: rel, as: asValue || '', href: href });
+    } catch (error) {
+      remember('extensions.resource-preload-error', { href: href || '', error: String(error && error.message || error) });
+    }
+  }
+
+  function preloadExtensionResources(name, manifest) {
+    try {
+      if (!EXTENSION_PRELOAD.enabled || !manifest || typeof manifest !== 'object') return;
+      var js = typeof manifest.js === 'string' ? manifest.js : '';
+      var css = typeof manifest.css === 'string' ? manifest.css : '';
+      if (js) {
+        var jsHref = extensionAssetPathForName(name, js);
+        if (jsHref) addExtensionResourcePreload(jsHref, 'modulepreload', 'script');
+      }
+      if (css) {
+        var cssHref = extensionAssetPathForName(name, css);
+        if (cssHref) addExtensionResourcePreload(cssHref, 'preload', 'style');
+      }
+    } catch (error) {
+      remember('extensions.resource-preload-list-error', { name: name, error: String(error && error.message || error) });
+    }
+  }
+
   function startExtensionManifestPrefetch(rawFetch, name) {
     if (!EXTENSION_PRELOAD.enabled || !rawFetch || !name) return null;
     var pathname = manifestPathForExtensionName(name);
@@ -3437,7 +3671,6 @@ ${fastRoutes}
     var existing = extensionManifestPrefetches.get(pathname);
     if (existing) return existing.promise;
     var record = { ok: false, path: pathname, state: 'pending', promise: null, text: '', status: 0, statusText: '', headers: [], error: null, startedAt: Date.now(), finishedAt: 0, durationMs: 0 };
-    remember('extensions.manifest.prefetch-start-one', { path: pathname });
     record.promise = rawFetch(pathname, { method: 'GET', credentials: 'same-origin', cache: 'force-cache', redirect: 'manual' })
       .then(async function (response) {
         record.ok = !!response.ok;
@@ -3449,6 +3682,13 @@ ${fastRoutes}
         record.finishedAt = Date.now();
         record.durationMs = record.finishedAt - record.startedAt;
         if (!response.ok) record.error = 'HTTP ' + response.status;
+        if (response.ok && record.text) {
+          try {
+            preloadExtensionResources(name, JSON.parse(record.text));
+          } catch (error) {
+            remember('extensions.resource-preload-parse-error', { name: name, path: pathname, error: String(error && error.message || error) });
+          }
+        }
         return record;
       })
       .catch(function (error) {
@@ -3503,9 +3743,29 @@ ${fastRoutes}
       if (!record || !record.promise) return null;
       var ready = await record.promise;
       if (!ready || ready.state !== 'ready' || !ready.text) return null;
-      return JSON.parse(ready.text);
+      var manifest = JSON.parse(ready.text);
+      preloadExtensionResources(name, manifest);
+      return manifest;
     } catch (error) {
       remember('extensions.manifest.get-prefetch-error', { name: name, error: String(error && error.message || error) });
+      return null;
+    }
+  };
+
+  state.getExtensionDiscover = async function getExtensionDiscover() {
+    try {
+      var fetcher = state.rawFetch;
+      if (!fetcher && !state.patchedFetch && typeof window.fetch === 'function') fetcher = window.fetch.bind(window);
+      if (!extensionDiscoverPrefetch && fetcher) startExtensionDiscoverPrefetch(fetcher, 'discover-getter');
+      if (!extensionDiscoverPrefetch) return null;
+      var ready = await extensionDiscoverPrefetch;
+      if (!ready || !ready.ok || !ready.text) return null;
+      var list = JSON.parse(ready.text);
+      if (!Array.isArray(list)) return null;
+      remember('extensions.discover.get-prefetch-hit', { count: list.length, durationMs: ready.durationMs });
+      return list;
+    } catch (error) {
+      remember('extensions.discover.get-prefetch-error', { error: String(error && error.message || error) });
       return null;
     }
   };
@@ -3558,6 +3818,38 @@ ${fastRoutes}
       }
     })();
     return groupsAllPrefetch;
+  }
+
+  function startCharactersAllWarm(rawFetch, token) {
+    if (!STARTUP_PRELOAD.enabled || !rawFetch || !token) return null;
+    if (charactersAllWarmPrefetch) return charactersAllWarmPrefetch;
+    charactersAllWarmPrefetch = (async function () {
+      var startedAt = Date.now();
+      try {
+        remember('characters.all.warm-start');
+        var headers = new Headers();
+        headers.set('content-type', 'application/json');
+        headers.set('x-csrf-token', token);
+        headers.set(HEADER_PREFIX + '-early', VERSION);
+        var response = await rawFetch(PREFIX + '/warm', {
+          method: 'POST',
+          headers: headers,
+          credentials: 'same-origin',
+          cache: 'no-store',
+          redirect: 'manual',
+          body: JSON.stringify({ endpoints: ['characters-all'], wait: false, force: false })
+        });
+        var text = await response.text();
+        var record = makeApiRecordFromResponse(response, text, startedAt);
+        remember(record.ok ? 'characters.all.warm-ready' : 'characters.all.warm-bad-status', { status: record.status, durationMs: record.durationMs });
+        return record;
+      } catch (error) {
+        var record = { ok: false, error: String(error && error.message || error), durationMs: Date.now() - startedAt };
+        remember('characters.all.warm-error', record);
+        return record;
+      }
+    })();
+    return charactersAllWarmPrefetch;
   }
 
   async function consumePrefetchRecord(promise, label, startedAt) {
@@ -3637,6 +3929,8 @@ ${fastRoutes}
             if (settingsGetCsrfToken) startSettingsGetPrefetch(rawFetch, settingsGetCsrfToken);
             if (settingsGetCsrfToken) startBackgroundsAllPrefetch(rawFetch, settingsGetCsrfToken);
             if (settingsGetCsrfToken) startGroupsAllPrefetch(rawFetch, settingsGetCsrfToken);
+            if (settingsGetCsrfToken) startCharactersAllWarm(rawFetch, settingsGetCsrfToken);
+            if (settingsGetCsrfToken) state.flushBrowserLogs?.();
           } catch (_) {}
           remember('csrf.prefetch-ready', { status: record.status, durationMs: record.durationMs, startedSettingsGet: !!settingsGetPrefetch });
         } else {
@@ -3679,6 +3973,8 @@ ${fastRoutes}
       if (settingsGetCsrfToken) startSettingsGetPrefetch(rawFetch, settingsGetCsrfToken);
       if (settingsGetCsrfToken) startBackgroundsAllPrefetch(rawFetch, settingsGetCsrfToken);
       if (settingsGetCsrfToken) startGroupsAllPrefetch(rawFetch, settingsGetCsrfToken);
+      if (settingsGetCsrfToken) startCharactersAllWarm(rawFetch, settingsGetCsrfToken);
+      if (settingsGetCsrfToken) state.flushBrowserLogs?.();
     } catch (error) {
       remember('settings.get.csrf-capture-error', { error: String(error && error.message || error) });
     }
@@ -4505,6 +4801,8 @@ ${fastRoutes}
   async function callFast(rawFetch, input, init, route, url, method) {
     var startedAt = Date.now();
     var isCharactersAll = url && url.pathname === '/api/characters/all';
+    var cpCharactersAllSlowTimer = null;
+    var cpCharactersAllVerySlowTimer = null;
     if (method === 'GET') {
       var prefetched = fastGetPrefetches.get(url.pathname);
       if (prefetched && prefetched.promise) {
@@ -4522,6 +4820,9 @@ ${fastRoutes}
     if (method !== 'GET' && method !== 'HEAD' && !headers.has('content-type')) headers.set('content-type', 'application/json');
 
     if (isCharactersAll) {
+      remember('intercept.characters-all.enter', { fastPath: route.path, method: method, controller: navigator.serviceWorker && navigator.serviceWorker.controller && navigator.serviceWorker.controller.scriptURL || '' });
+      cpCharactersAllSlowTimer = setTimeout(function () { remember('intercept.characters-all.waiting-over-500ms', { fastPath: route.path, elapsedMs: Date.now() - startedAt }); }, 500);
+      cpCharactersAllVerySlowTimer = setTimeout(function () { remember('intercept.characters-all.waiting-over-2000ms', { fastPath: route.path, elapsedMs: Date.now() - startedAt }); }, 2000);
       cpUpdateCharacterProgress({ active: true, phase: 'requesting', cache: '', message: '\u6B63\u5728\u52A0\u8F7D\u89D2\u8272\u5217\u8868\u2026', bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, error: null, startedAt: startedAt });
       cpStartCharacterStatusPolling(rawFetch, headers);
     }
@@ -4537,6 +4838,8 @@ ${fastRoutes}
       if (route.method !== 'GET' && route.method !== 'HEAD' && body !== undefined) fastInit.body = body;
       var response = await rawFetch(route.path, fastInit);
       if (response && response.status !== 404 && response.status !== 503) {
+        if (cpCharactersAllSlowTimer) { clearTimeout(cpCharactersAllSlowTimer); cpCharactersAllSlowTimer = null; }
+        if (cpCharactersAllVerySlowTimer) { clearTimeout(cpCharactersAllVerySlowTimer); cpCharactersAllVerySlowTimer = null; }
         var cacheState = response.headers.get(HEADER_PREFIX + '-state') || response.headers.get('x-cocktail-cache') || '';
         if (isCharactersAll) {
           cpUpdateCharacterProgress({ phase: cacheState === 'ASYNC-MISS' ? 'requesting' : 'rendering', cache: cacheState, status: response.status, percent: cacheState === 'ASYNC-MISS' ? null : 100, etaMs: 0, message: cacheState === 'ASYNC-MISS' ? '\u540E\u7AEF\u6B63\u5728\u6784\u5EFA\u89D2\u8272\u7F13\u5B58\uFF0C\u9996\u6B21\u52A0\u8F7D\u53EF\u80FD\u8F83\u4E45\u2026' : '\u89D2\u8272\u6570\u636E\u5DF2\u8FD4\u56DE\uFF0C\u6B63\u5728\u89E3\u6790\u5E76\u6E32\u67D3\u5217\u8868\u2026' });
@@ -4546,11 +4849,16 @@ ${fastRoutes}
           }
         }
         remember('intercept.fast-response', { path: url.pathname, status: response.status, cache: cacheState, durationMs: Date.now() - startedAt });
+        if (isCharactersAll) remember('intercept.characters-all.fast-return', { status: response.status, cache: cacheState, durationMs: Date.now() - startedAt, async: response.headers.get(HEADER_PREFIX + '-async') || '' });
         return response;
       }
+      if (cpCharactersAllSlowTimer) { clearTimeout(cpCharactersAllSlowTimer); cpCharactersAllSlowTimer = null; }
+      if (cpCharactersAllVerySlowTimer) { clearTimeout(cpCharactersAllVerySlowTimer); cpCharactersAllVerySlowTimer = null; }
       if (isCharactersAll) cpUpdateCharacterProgress({ phase: 'requesting', message: '\u5FEB\u901F\u63A5\u53E3\u4E0D\u53EF\u7528\uFF0C\u56DE\u9000\u539F\u59CB\u89D2\u8272\u63A5\u53E3\u2026' });
       remember('intercept.fallback-status', { path: url.pathname, status: response && response.status, durationMs: Date.now() - startedAt });
     } catch (error) {
+      if (cpCharactersAllSlowTimer) { clearTimeout(cpCharactersAllSlowTimer); cpCharactersAllSlowTimer = null; }
+      if (cpCharactersAllVerySlowTimer) { clearTimeout(cpCharactersAllVerySlowTimer); cpCharactersAllVerySlowTimer = null; }
       if (isCharactersAll) cpUpdateCharacterProgress({ phase: 'error', error: String(error && error.message || error), message: '\u5FEB\u901F\u63A5\u53E3\u8BF7\u6C42\u5931\u8D25\uFF0C\u6B63\u5728\u56DE\u9000\u539F\u59CB\u89D2\u8272\u63A5\u53E3\u2026' });
       remember('intercept.error', { path: url.pathname, error: String(error && error.message || error), durationMs: Date.now() - startedAt });
     }
@@ -4592,6 +4900,7 @@ ${fastRoutes}
         if (recentChatsResponse) return recentChatsResponse;
       }
       if (url && url.origin === location.origin && url.pathname === '/api/extensions/discover' && method === 'GET') {
+        if (!extensionDiscoverPrefetch) startExtensionDiscoverPrefetch(rawFetch, 'fetch-intercept');
         var extensionResponse = await consumePrefetchRecord(extensionDiscoverPrefetch, 'extensions.discover', Date.now());
         if (extensionResponse) return extensionResponse;
       }
@@ -4664,6 +4973,7 @@ ${fastRoutes}
   }
 
   if (!BRIDGE_ENABLED) { remember('disabled', { version: VERSION }); return; }
+  cpInstallBrowserLogCapture();
   installModuleImportMapIfMissing();
   patchModuleScripts();
   checkMainModuleProxyStatus('bridge-ready');
@@ -4810,13 +5120,34 @@ function sendFetchResult(res, result, state, entry = null, extraHeaders = null) 
   res.setHeader("content-type", result.headers?.["content-type"] || "application/json; charset=utf-8");
   res.send(result.bodyText ?? "");
 }
+function logFastDecision(endpointKey, decision, detail = {}) {
+  if (endpointKey !== "characters-all") return;
+  try {
+    console.info("[cocktail-plus:fast-diag]", decision, {
+      endpointKey,
+      at: (/* @__PURE__ */ new Date()).toISOString(),
+      ...detail
+    });
+  } catch {
+  }
+}
 async function handleFast(req, res, endpointKey) {
+  const startedAt = Date.now();
   stats.requests++;
   const endpoint = ENDPOINTS[endpointKey];
   const ctx = makeRequestContext(req);
   ctx.requestId = nextRequestId(endpointKey);
+  logFastDecision(endpointKey, "request-enter", {
+    requestId: ctx.requestId,
+    method: req.method,
+    cacheEnabled: !!config.enabled && !!config[endpoint.configKey],
+    asyncCharactersAllOnMiss: !!config.asyncCharactersAllOnMiss,
+    allowEmptyCharactersAllOnMiss: !!config.allowEmptyCharactersAllOnMiss,
+    blockCharactersAllOnMiss: !!config.blockCharactersAllOnMiss
+  });
   if (!config.enabled || !config[endpoint.configKey]) {
     const result = await fetchOriginal(ctx, endpoint);
+    logFastDecision(endpointKey, "bypass-original-return", { requestId: ctx.requestId, status: result.status, durationMs: Date.now() - startedAt });
     return sendFetchResult(res, result, "BYPASS");
   }
   const signature = endpoint.getSignature(ctx);
@@ -4831,6 +5162,7 @@ async function handleFast(req, res, endpointKey) {
       stats.hits++;
       entry.hitCount = Number(entry.hitCount || 0) + 1;
       memoryCache.set(cacheKey, entry);
+      logFastDecision(endpointKey, "hit-return", { requestId: ctx.requestId, status: entry.status, ageMs, signatureMatches, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(entry.bodyText || "", "utf8") });
       return sendEntry(res, entry, "HIT");
     }
     if (config.staleWhileRevalidate && (signatureMatches || endpoint.staleOnSignatureChange)) {
@@ -4841,6 +5173,7 @@ async function handleFast(req, res, endpointKey) {
       const reason = signatureMatches ? "max-stale-expired" : "signature-changed";
       void refreshEntry(ctx, endpointKey, reason).catch(() => {
       });
+      logFastDecision(endpointKey, "stale-return", { requestId: ctx.requestId, state, reason, ageMs, signatureMatches, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(entry.bodyText || "", "utf8") });
       return sendEntry(res, entry, state);
     }
   }
@@ -4862,6 +5195,7 @@ async function handleFast(req, res, endpointKey) {
     writeDiskEntry(ctx, endpointKey, fastEntry);
     if (fastMiss.refreshReason) void refreshEntry(ctx, endpointKey, fastMiss.refreshReason).catch(() => {
     });
+    logFastDecision(endpointKey, "fast-miss-return", { requestId: ctx.requestId, state: fastMiss.state, refreshReason: fastMiss.refreshReason, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(fastMiss.bodyText || "", "utf8") });
     return sendEntry(res, fastEntry, fastMiss.state, fastMiss.extraResponseHeaders);
   }
   const asyncMiss = !entry ? endpoint.makeAsyncMiss?.(ctx, signature, config) : null;
@@ -4869,18 +5203,23 @@ async function handleFast(req, res, endpointKey) {
     stats.misses++;
     if (asyncMiss.refreshReason) void refreshEntry(ctx, endpointKey, asyncMiss.refreshReason).catch(() => {
     });
+    logFastDecision(endpointKey, "async-miss-return", { requestId: ctx.requestId, state: asyncMiss.state, refreshReason: asyncMiss.refreshReason, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(asyncMiss.bodyText || "", "utf8") });
     return sendFetchResult(res, asyncMiss, asyncMiss.state, null, asyncMiss.extraResponseHeaders);
   }
   stats.misses++;
   try {
+    logFastDecision(endpointKey, "blocking-refresh-start", { requestId: ctx.requestId, hasEntry: !!entry, durationMs: Date.now() - startedAt });
     const { result, entry: refreshedEntry } = await refreshEntry(ctx, endpointKey, entry ? "blocking-refresh" : "miss");
     if (refreshedEntry) {
+      logFastDecision(endpointKey, "blocking-refresh-entry-return", { requestId: ctx.requestId, status: refreshedEntry.status, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(refreshedEntry.bodyText || "", "utf8") });
       return sendEntry(res, refreshedEntry, entry ? "REFRESH" : "MISS");
     }
+    logFastDecision(endpointKey, "blocking-refresh-result-return", { requestId: ctx.requestId, status: result?.status, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(result?.bodyText || "", "utf8") });
     return sendFetchResult(res, result, entry ? "REFRESH" : "MISS");
   } catch (error) {
     if (entry) {
       entry.lastError = error instanceof Error ? error.message : String(error);
+      logFastDecision(endpointKey, "stale-error-return", { requestId: ctx.requestId, error: entry.lastError, durationMs: Date.now() - startedAt });
       return sendEntry(res, entry, "STALE-ERROR");
     }
     res.status(502).json({ ok: false, error: error instanceof Error ? error.message : String(error), plugin: info });
@@ -5459,6 +5798,7 @@ async function handleTemplateFallback(request) {
   }
 }
 
+
 function endpointsToInvalidate(pathname) {
   const out = [];
   if (pathname.startsWith('/api/characters/') && pathname !== '/api/characters/all' && pathname !== '/api/characters/get' && pathname !== '/api/characters/chats') out.push('characters-all');
@@ -5497,6 +5837,7 @@ self.addEventListener('fetch', (event) => {
   if (!sameOrigin(url)) return;
 
   const pathname = url.pathname;
+
 
   if (TEMPLATE_FALLBACK.enabled && request.method === 'GET' && isTemplatePath(pathname)) {
     event.respondWith(handleTemplateFallback(request));
@@ -6023,8 +6364,8 @@ async function safeStat(filePath) {
 }
 async function listJsonlFiles(directory) {
   try {
-    const entries = await fs14.promises.readdir(directory, { withFileTypes: true });
-    return entries.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".jsonl").map((e) => e.name);
+    const entries2 = await fs14.promises.readdir(directory, { withFileTypes: true });
+    return entries2.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".jsonl").map((e) => e.name);
   } catch {
     return [];
   }
@@ -6033,13 +6374,13 @@ async function collectCharacterChatFiles(ctx, allChatFiles) {
   const charactersDir = ctx.directories?.characters;
   const chatsRoot = ctx.directories?.chats;
   if (!charactersDir || !chatsRoot) return;
-  let entries = [];
+  let entries2 = [];
   try {
-    entries = await fs14.promises.readdir(charactersDir, { withFileTypes: true });
+    entries2 = await fs14.promises.readdir(charactersDir, { withFileTypes: true });
   } catch {
     return;
   }
-  const pngFiles = entries.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".png").map((e) => e.name);
+  const pngFiles = entries2.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".png").map((e) => e.name);
   await Promise.all(pngFiles.map(async (pngFile) => {
     const chatsDirectory = pngFile.replace(/\.png$/i, "");
     const pathToChats = path13.join(chatsRoot, chatsDirectory);
@@ -6062,13 +6403,13 @@ async function collectGroupChatFiles(ctx, allChatFiles, groupInfoMap) {
   const groupsDir = ctx.directories?.groups;
   const groupChatsDir = ctx.directories?.groupChats;
   if (!groupsDir || !groupChatsDir) return;
-  let entries = [];
+  let entries2 = [];
   try {
-    entries = await fs14.promises.readdir(groupsDir, { withFileTypes: true });
+    entries2 = await fs14.promises.readdir(groupsDir, { withFileTypes: true });
   } catch {
     return;
   }
-  const groupFiles = entries.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".json").map((e) => e.name);
+  const groupFiles = entries2.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".json").map((e) => e.name);
   await Promise.all(groupFiles.map(async (groupFile) => {
     try {
       const groupPath = path13.join(groupsDir, groupFile);
@@ -6095,13 +6436,13 @@ async function collectGroupChatFiles(ctx, allChatFiles, groupInfoMap) {
 async function collectRootChatFiles(ctx, allChatFiles) {
   const chatsRoot = ctx.directories?.chats;
   if (!chatsRoot) return;
-  let entries = [];
+  let entries2 = [];
   try {
-    entries = await fs14.promises.readdir(chatsRoot, { withFileTypes: true });
+    entries2 = await fs14.promises.readdir(chatsRoot, { withFileTypes: true });
   } catch {
     return;
   }
-  const rootJsonlFiles = entries.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".jsonl").map((e) => e.name);
+  const rootJsonlFiles = entries2.filter((e) => e.isFile() && path13.extname(e.name).toLowerCase() === ".jsonl").map((e) => e.name);
   await Promise.all(rootJsonlFiles.map(async (file) => {
     const filePath = path13.join(chatsRoot, file);
     const stat = await safeStat(filePath);
@@ -6380,10 +6721,14 @@ function patchScriptJs(source) {
   ].join("\n"));
   if (config.patchStartupInit) out = out.replace(coreDataRegex, (_match, indent) => [
     `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.before-core-data-parallel');`,
-    `${indent}const userAvatarsPromise = getUserAvatars(true, user_avatar);`,
-    `${indent}const charactersPromise = getCharacters();`,
-    `${indent}const backgroundsPromise = getBackgrounds();`,
-    `${indent}const tokenizersPromise = initTokenizers();`,
+    `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.before-getUserAvatars');`,
+    `${indent}const userAvatarsPromise = getUserAvatars(true, user_avatar).finally(() => globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.after-getUserAvatars'));`,
+    `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.before-getCharacters');`,
+    `${indent}const charactersPromise = getCharacters().finally(() => globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.after-getCharacters', { cache: globalThis.__cocktailPlusEarlyBridge?.charactersLoad?.cache || '', phase: globalThis.__cocktailPlusEarlyBridge?.charactersLoad?.phase || '', count: Array.isArray(characters) ? characters.length : null }));`,
+    `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.before-getBackgrounds');`,
+    `${indent}const backgroundsPromise = getBackgrounds().finally(() => globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.after-getBackgrounds'));`,
+    `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.before-initTokenizers');`,
+    `${indent}const tokenizersPromise = initTokenizers().finally(() => globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.after-initTokenizers'));`,
     `${indent}await Promise.all([userAvatarsPromise, charactersPromise, backgroundsPromise, tokenizersPromise]);`,
     `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.after-core-data-parallel');`
   ].join("\n"));
@@ -6419,6 +6764,66 @@ function patchScriptJs(source) {
     `${indent}};`,
     `${indent}(globalThis.requestIdleCallback || function (cb) { return setTimeout(cb, 1); })(() => { void cpRunPostFirstPaintInit(); });`
   ].join("\n"));
+  out = out.replace(/([ \t]*)initRossMods\(\);\s*\r?\n/, (_match, indent) => [
+    `${indent}const cpCharactersAsyncMissAtRossInit = globalThis.__cocktailPlusEarlyBridge?.charactersLoad?.cache === 'ASYNC-MISS';`,
+    `${indent}const cpAutoLoadChatSettingAtRossInit = !!power_user.auto_load_chat;`,
+    `${indent}if (cpCharactersAsyncMissAtRossInit && cpAutoLoadChatSettingAtRossInit) power_user.auto_load_chat = false;`,
+    `${indent}initRossMods();`,
+    `${indent}if (cpCharactersAsyncMissAtRossInit && cpAutoLoadChatSettingAtRossInit) {`,
+    `${indent}    power_user.auto_load_chat = cpAutoLoadChatSettingAtRossInit;`,
+    `${indent}    const cpRunAutoloadAfterCharactersReady = async () => {`,
+    `${indent}        if (globalThis.__cocktailPlusAutoLoadAfterAsyncMissDone) return;`,
+    `${indent}        globalThis.__cocktailPlusAutoLoadAfterAsyncMissDone = true;`,
+    `${indent}        try {`,
+    `${indent}            if (active_character !== null && active_character !== undefined) {`,
+    `${indent}                const activeCharacterId = characters.findIndex(x => getTagKeyForEntity(x) === active_character);`,
+    `${indent}                if (activeCharacterId !== -1) {`,
+    `${indent}                    await selectCharacterById(activeCharacterId);`,
+    `${indent}                    try { applyTagsOnCharacterSelect.call($('#rm_print_characters_block .character_select[chid="' + activeCharacterId + '"]')); } catch (_) {}`,
+    `${indent}                } else {`,
+    `${indent}                    console.warn('[cocktail-plus] active character still not found after async characters refresh', active_character);`,
+    `${indent}                }`,
+    `${indent}            } else if (active_group !== null && active_group !== undefined) {`,
+    `${indent}                try { select_group_chats(String(active_group), false); } catch (_) {}`,
+    `${indent}            }`,
+    `${indent}        } catch (error) {`,
+    `${indent}            console.error('[cocktail-plus] async characters auto-load recovery failed', error);`,
+    `${indent}        }`,
+    `${indent}    };`,
+    `${indent}    try {`,
+    `${indent}        eventSource.once(event_types.CHARACTER_PAGE_LOADED, () => { void cpRunAutoloadAfterCharactersReady(); });`,
+    `${indent}    } catch (_) {}`,
+    `${indent}    setTimeout(() => { if (characters.length > 0) void cpRunAutoloadAfterCharactersReady(); }, 5000);`,
+    `${indent}}`
+  ].join("\n") + "\n");
+  out = out.replace(
+    `export async function getCharacters() {
+    const response = await fetch('/api/characters/all', {`,
+    `export async function getCharacters() {
+    const cpGetCharactersStartedAt = performance.now();
+    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('getCharacters.enter');
+    const response = await fetch('/api/characters/all', {`
+  );
+  out = out.replace(
+    `        characters.splice(0, characters.length);
+        const getData = await response.json();`,
+    `        characters.splice(0, characters.length);
+        const cpCharactersAllState = response.headers?.get?.('x-cocktail-plus-state') || response.headers?.get?.('x-cocktail-cache') || '';
+        const cpCharactersAllAsync = response.headers?.get?.('x-cocktail-plus-async') || '';
+        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('getCharacters.response-before-json', { status: response.status, state: cpCharactersAllState, async: cpCharactersAllAsync, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt) });
+        console.info('[cocktail-plus:diag] getCharacters response before json', { status: response.status, state: cpCharactersAllState, async: cpCharactersAllAsync, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt) });
+        const getData = await response.json();
+        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('getCharacters.response-json-parsed', { count: Array.isArray(getData) ? getData.length : null, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt) });`
+  );
+  out = out.replace(
+    `        await printCharacters(true);
+    } else {`,
+    `        await printCharacters(true);
+        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('getCharacters.done', { count: characters.length, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt), state: cpCharactersAllState });
+        console.info('[cocktail-plus:diag] getCharacters done', { count: characters.length, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt), state: cpCharactersAllState });
+    } else {
+        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('getCharacters.non-ok', { status: response.status, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt) });`
+  );
   if (config.patchStartupInit && readyCallbackStartRegex.test(out)) {
     out = out.replace(readyCallbackStartRegex, (match) => `${match}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('ready-callback.enter');
 `);
@@ -6431,11 +6836,27 @@ function patchScriptJs(source) {
   patchFlags.readyFirstLoadStartedEarlyApplied = false;
   const firstLoadRegex = /(async\s+function\s+firstLoadInit\s*\(\s*\)\s*\{\r?\n)/;
   patchFlags.firstLoadDiagnosticInserted = config.patchStartupInit && firstLoadRegex.test(out);
+  patchFlags.cpGetCharactersDiagnosticsApplied = out.includes("getCharacters.response-before-json");
+  patchFlags.cpRossAutoloadGuardApplied = out.includes("cpCharactersAsyncMissAtRossInit");
   const diagnostic = JSON.stringify({ version: VERSION, ...patchFlags });
   if (patchFlags.firstLoadDiagnosticInserted) {
     out = out.replace(firstLoadRegex, `$1    console.info('[cp:module-proxy] firstLoadInit patches active', ${diagnostic});
     globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.enter', ${diagnostic});
+    try {
+        [
+            event_types.EXTENSION_SETTINGS_LOADED,
+            event_types.SETTINGS_LOADED,
+            event_types.SETTINGS_UPDATED,
+        ].filter(Boolean).forEach(eventName => eventSource?.autoFireAfterEmit?.add?.(eventName));
+        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('event-replay.enabled', { events: ['EXTENSION_SETTINGS_LOADED', 'SETTINGS_LOADED', 'SETTINGS_UPDATED'] });
+    } catch (error) {
+        console.warn('[cocktail-plus] event replay setup failed', error);
+    }
 `);
+  }
+  try {
+    console.info("[cocktail-plus:module-diag] patchScriptJs", { version: VERSION, ...patchFlags });
+  } catch {
   }
   out += `
 try { console.info('[cp:module-proxy] loaded /script.js', ${diagnostic}); } catch (_) {}
@@ -6489,6 +6910,7 @@ function patchSystemMessagesJs(source) {
 }
 function patchExtensionsJs(source) {
   let out = source;
+  const before = out;
   if (config.patchExtensionManifests) {
     out = out.replace(
       `            fetch(\`/scripts/extensions/\${name}/manifest.json\`).then(async response => {
@@ -6496,6 +6918,31 @@ function patchExtensionsJs(source) {
                     const json = await response.json();`,
       `            (globalThis.__cocktailPlusEarlyBridge?.getExtensionManifest?.(name)?.then(json => json ?? fetch(\`/scripts/extensions/\${name}/manifest.json\`).then(r => r.ok ? r.json() : Promise.reject())) ?? fetch(\`/scripts/extensions/\${name}/manifest.json\`).then(r => r.ok ? r.json() : Promise.reject())).then(async json => {
                 if (json) {`
+    );
+  }
+  if (config.patchExtensionManifests) {
+    out = out.replace(
+      `        const response = await fetch('/api/extensions/discover');
+
+        if (response.ok) {
+            const extensions = await response.json();
+            return extensions;
+        } else {
+            return [];
+        }`,
+      `        const prefetched = await globalThis.__cocktailPlusEarlyBridge?.getExtensionDiscover?.();
+        if (Array.isArray(prefetched)) {
+            globalThis.__cocktailPlusEarlyBridge?.markStartup?.('extensions.discover.prefetch-used', { count: prefetched.length });
+            return prefetched;
+        }
+        const response = await fetch('/api/extensions/discover');
+
+        if (response.ok) {
+            const extensions = await response.json();
+            return extensions;
+        } else {
+            return [];
+        }`
     );
   }
   if (config.patchExtensionManifests) {
@@ -6514,11 +6961,22 @@ function patchExtensionsJs(source) {
     globalThis.__cocktailPlusEarlyBridge?.markStartup?.('loadExtensionSettings.after-getManifests', { count: Object.keys(manifests || {}).length });`
     );
   }
-  if (config.patchParallelActivateExtensions) {
+  if (config.patchExtensionManifests && !out.includes("cpPrefetchedExtensions")) {
+    out = out.replace(
+      /async\s+function\s+discoverExtensions\s*\(\s*\)\s*\{\s*try\s*\{/,
+      (match) => `${match}
+        const cpPrefetchedExtensions = await globalThis.__cocktailPlusEarlyBridge?.getExtensionDiscover?.();
+        if (Array.isArray(cpPrefetchedExtensions)) {
+            globalThis.__cocktailPlusEarlyBridge?.markStartup?.('extensions.discover.prefetch-used', { count: cpPrefetchedExtensions.length });
+            return cpPrefetchedExtensions;
+        }`
+    );
+  }
+  if (config.deferExtensionActivationUntilAppReady) {
     out = out.replace(
       /([ \t]*)await\s+activateExtensions\(\)\s*;?\s*\r?\n\1if\s*\(extension_settings\.autoConnect\s*&&\s*extension_settings\.apiUrl\)\s*\{\s*\r?\n\1[ \t]*connectToApi\(extension_settings\.apiUrl\);\s*\r?\n\1\}/,
       (_match, indent) => [
-        `${indent}const cpActivateExtensionsAfterFirstPaint = async () => {`,
+        `${indent}const cpActivateExtensionsAfterAppReady = async () => {`,
         `${indent}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('extensions.activate.deferred-start');`,
         `${indent}    try {`,
         `${indent}        await activateExtensions();`,
@@ -6530,16 +6988,16 @@ function patchExtensionsJs(source) {
         `${indent}    }`,
         `${indent}};`,
         `${indent}const cpScheduleExtensionActivation = () => {`,
-        `${indent}    const run = () => setTimeout(() => {`,
-        `${indent}        void cpActivateExtensionsAfterFirstPaint().catch(error => console.error('[cocktail-plus] deferred extension activation failed', error));`,
+        `${indent}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('extensions.activate.deferred-scheduled');`,
+        `${indent}    setTimeout(() => {`,
+        `${indent}        void cpActivateExtensionsAfterAppReady().catch(error => console.error('[cocktail-plus] deferred extension activation failed', error));`,
         `${indent}    }, 0);`,
-        `${indent}    try {`,
-        `${indent}        eventSource.once(event_types.APP_READY, run);`,
-        `${indent}    } catch (_) {`,
-        `${indent}        run();`,
-        `${indent}    }`,
         `${indent}};`,
-        `${indent}cpScheduleExtensionActivation();`
+        `${indent}try {`,
+        `${indent}    eventSource.once(event_types.APP_READY, cpScheduleExtensionActivation);`,
+        `${indent}} catch (_) {`,
+        `${indent}    cpScheduleExtensionActivation();`,
+        `${indent}}`
       ].join("\n")
     );
   }
@@ -6549,7 +7007,10 @@ function patchExtensionsJs(source) {
                     Promise.all([addExtensionScript(name, manifest), addExtensionStyle(name, manifest)]),
                 );
                 await promise
-                    .then(() => activeExtensions.add(name))
+                    .then(() => {
+                        activeExtensions.add(name);
+                        return callExtensionHook(name, 'activate');
+                    })
                     .catch(err => {
                         console.log('Could not activate extension', name, err);
                         extensionLoadErrors.add(t\`Extension "\${displayName}" failed to load: \${err}\`);
@@ -6558,13 +7019,37 @@ function patchExtensionsJs(source) {
       `                const promise = addExtensionLocale(name, manifest).finally(() =>
                     Promise.all([addExtensionScript(name, manifest), addExtensionStyle(name, manifest)]),
                 )
-                    .then(() => activeExtensions.add(name))
+                    .then(() => {
+                        activeExtensions.add(name);
+                        return callExtensionHook(name, 'activate');
+                    })
                     .catch(err => {
                         console.log('Could not activate extension', name, err);
                         extensionLoadErrors.add(t\`Extension "\${displayName}" failed to load: \${err}\`);
                     });
                 promises.push(promise);`
     );
+  }
+  if (config.patchParallelActivateExtensions && /\bawait\s+promise\s*\r?\n/.test(out)) {
+    out = out.replace(
+      /([ \t]*)await\s+promise\s*\r?\n([\s\S]*?\r?\n\1promises\.push\(promise\);)/,
+      (_match, indent, tail) => {
+        const nextTail = String(tail).replace(/promises\.push\(promise\);/, "promises.push(cpActivationPromise);");
+        return `${indent}const cpActivationPromise = promise
+${nextTail}`;
+      }
+    );
+  }
+  try {
+    console.info("[cocktail-plus:module-diag] patchExtensionsJs", {
+      version: VERSION,
+      changed: before !== out,
+      discoverPrefetchPatchApplied: out.includes("getExtensionDiscover"),
+      manifestPrefetchPatchApplied: out.includes("getExtensionManifest"),
+      parallelActivatePatchApplied: out.includes("cpActivationPromise") || !out.includes("await promise") && out.includes("return callExtensionHook(name, 'activate')"),
+      deferActivationApplied: out.includes("cpActivateExtensionsAfterAppReady")
+    });
+  } catch {
   }
   return out;
 }
@@ -6731,6 +7216,7 @@ function makeEtag(source) {
 }
 async function handleModuleProxy(req, res) {
   try {
+    const startedAt = Date.now();
     const { publicPath, fullPath } = normalizePublicPath(req.query?.path || req.path || "");
     let source = await fs15.promises.readFile(fullPath, "utf8");
     source = applyTargetedPatches(source, publicPath);
@@ -6738,6 +7224,7 @@ async function handleModuleProxy(req, res) {
     source += `
 //# sourceURL=${publicPath}
 `;
+    console.info("[cocktail-plus:route-diag] serving module proxy", { publicPath, bytes: Buffer.byteLength(source, "utf8"), durationMs: Date.now() - startedAt });
     const etag = makeEtag(source);
     res.setHeader(HEADER_PREFIX, VERSION);
     res.setHeader(`${HEADER_PREFIX}-module-proxy`, publicPath);
@@ -7014,6 +7501,122 @@ async function handleFrontendUpdate(req, res) {
   }
 }
 
+// server-plugins/cocktail-plus/src/browser-logs.ts
+var MAX_ENTRIES = 1e3;
+var MAX_INGEST_BATCH = 200;
+var MAX_FIELD_CHARS = 4e3;
+var nextId = 1;
+var entries = [];
+function clip(value, max = MAX_FIELD_CHARS) {
+  const text = String(value ?? "");
+  return text.length > max ? `${text.slice(0, max)}\u2026<truncated ${text.length - max}>` : text;
+}
+function normalizeArg(value) {
+  if (value === void 0) return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string") return clip(value);
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
+  if (value instanceof Error) return clip(`${value.name}: ${value.message}
+${value.stack || ""}`);
+  try {
+    return clip(JSON.stringify(value));
+  } catch {
+    try {
+      return clip(Object.prototype.toString.call(value));
+    } catch {
+      return "[unserializable]";
+    }
+  }
+}
+function normalizeEntry(raw, req) {
+  const args = Array.isArray(raw?.args) ? raw.args.map(normalizeArg) : [];
+  const message = raw?.message !== void 0 ? clip(raw.message) : clip(args.join(" "));
+  const level = ["debug", "log", "info", "warn", "error", "trace", "unhandledrejection", "window-error"].includes(String(raw?.level || "")) ? String(raw.level) : "log";
+  return {
+    id: nextId++,
+    receivedAt: Date.now(),
+    serverVersion: VERSION,
+    user: req?.user?.profile?.handle || "",
+    ip: req?.ip || req?.socket?.remoteAddress || "",
+    level,
+    message,
+    args,
+    stack: clip(raw?.stack || ""),
+    pageUrl: clip(raw?.pageUrl || raw?.url || ""),
+    source: clip(raw?.source || ""),
+    line: Number.isFinite(Number(raw?.line)) ? Number(raw.line) : null,
+    column: Number.isFinite(Number(raw?.column)) ? Number(raw.column) : null,
+    userAgent: clip(raw?.userAgent || req?.headers?.["user-agent"] || "", 1e3),
+    timestamp: Number.isFinite(Number(raw?.timestamp)) ? Number(raw.timestamp) : Date.now()
+  };
+}
+function pushEntry(entry) {
+  entries.push(entry);
+  while (entries.length > MAX_ENTRIES) entries.shift();
+  if (["error", "warn", "unhandledrejection", "window-error"].includes(entry.level)) {
+    const text = entry.message || entry.args?.join(" ") || "";
+    const printer = entry.level === "warn" ? console.warn : console.error;
+    printer(`[cocktail-plus:browser-${entry.level}]`, text, entry.stack ? `
+${entry.stack}` : "");
+  }
+}
+function ingestBrowserLogs(req) {
+  const body = req.body || {};
+  const rawEntries = Array.isArray(body.entries) ? body.entries : Array.isArray(body) ? body : [body];
+  const batch = rawEntries.slice(0, MAX_INGEST_BATCH).map((raw) => normalizeEntry(raw, req));
+  for (const entry of batch) pushEntry(entry);
+  return { ok: true, accepted: batch.length, total: entries.length, maxEntries: MAX_ENTRIES };
+}
+function ingestBrowserLogBeacon(req) {
+  let raw = null;
+  try {
+    if (req.query?.d) raw = JSON.parse(String(req.query.d));
+  } catch {
+    raw = null;
+  }
+  if (!raw) {
+    raw = {
+      level: req.query?.level || "log",
+      message: req.query?.message || "",
+      pageUrl: req.query?.pageUrl || "",
+      source: "beacon-query",
+      timestamp: Date.now()
+    };
+  }
+  const entry = normalizeEntry({ ...raw, source: raw.source || "early-beacon" }, req);
+  pushEntry(entry);
+  return { ok: true, accepted: 1, total: entries.length, maxEntries: MAX_ENTRIES };
+}
+function clearBrowserLogs() {
+  const removed = entries.length;
+  entries.splice(0, entries.length);
+  return { ok: true, removed };
+}
+function getBrowserLogs(limit = 200) {
+  const safeLimit = Math.max(1, Math.min(1e3, Number(limit) || 200));
+  const list = entries.slice(-safeLimit);
+  return {
+    ok: true,
+    version: VERSION,
+    total: entries.length,
+    maxEntries: MAX_ENTRIES,
+    entries: list,
+    text: formatBrowserLogs(list)
+  };
+}
+function formatBrowserLogs(list = entries) {
+  return list.map((entry) => {
+    const time = new Date(entry.receivedAt).toISOString();
+    const loc = entry.source ? ` ${entry.source}${entry.line !== null ? `:${entry.line}` : ""}${entry.column !== null ? `:${entry.column}` : ""}` : "";
+    const stack = entry.stack ? `
+${entry.stack}` : "";
+    return `[${time}] [${entry.level}]${loc} ${entry.message}${stack}`;
+  }).join("\n");
+}
+function getBrowserLogStatus() {
+  return { total: entries.length, maxEntries: MAX_ENTRIES, lastReceivedAt: entries.length ? entries[entries.length - 1].receivedAt : null };
+}
+
 // server-plugins/cocktail-plus/src/routes.ts
 function sendJson4(res, data) {
   res.setHeader(HEADER_PREFIX, VERSION);
@@ -7049,7 +7652,8 @@ function registerRoutes(router) {
       status: getUserStatus(ctx),
       settingsSave: getSettingsSaveStatus(),
       chatSave: getChatSaveStatus(),
-      settingsGet: getSettingsGetStatus()
+      settingsGet: getSettingsGetStatus(),
+      browserLogs: getBrowserLogStatus()
     });
   });
   router.get("/sw.js", async (_req, res) => {
@@ -7063,6 +7667,7 @@ function registerRoutes(router) {
     res.send(makeServiceWorkerScript());
   });
   router.get("/early/bridge.js", async (_req, res) => {
+    console.info("[cocktail-plus:route-diag] serving early bridge", { version: VERSION, earlyBridgeEnabled: !!config.earlyBridgeEnabled, moduleProxyEnabled: !!config.moduleProxyEnabled, patchStartupInit: !!config.patchStartupInit });
     if (!config.earlyBridgeEnabled) {
       res.setHeader("content-type", "application/javascript; charset=utf-8");
       res.setHeader("cache-control", "no-store, no-cache, must-revalidate, proxy-revalidate");
@@ -7105,6 +7710,24 @@ function registerRoutes(router) {
     sendJson4(res, { ok: true, chatsEnoentGuard: getChatsEnoentPatchStatus() });
   });
   router.post("/update/frontend", async (req, res) => handleFrontendUpdate(req, res));
+  router.post("/browser-logs/ingest", async (req, res) => {
+    sendJson4(res, ingestBrowserLogs(req));
+  });
+  router.get("/browser-logs/beacon", async (req, res) => {
+    ingestBrowserLogBeacon(req);
+    res.sendStatus(204);
+  });
+  router.post("/browser-logs/list", async (req, res) => {
+    sendJson4(res, getBrowserLogs(req.body?.limit));
+  });
+  router.get("/browser-logs/text", async (req, res) => {
+    const result = getBrowserLogs(req.query?.limit);
+    res.setHeader(HEADER_PREFIX, VERSION);
+    res.type("text/plain; charset=utf-8").send(result.text);
+  });
+  router.post("/browser-logs/clear", async (_req, res) => {
+    sendJson4(res, clearBrowserLogs());
+  });
   router.post("/source-patches/chats-enoent/apply", async (req, res) => {
     const result = applyChatsEnoentPatch();
     sendJson4(res, result);
@@ -7146,7 +7769,7 @@ function registerRoutes(router) {
   });
   router.post("/status", async (req, res) => {
     const ctx = makeRequestContext(req, { bodyOverride: {} });
-    sendJson4(res, { ok: true, stats, status: getUserStatus(ctx), earlyBridge: getEarlyBridgeStatus(), settingsSave: getSettingsSaveStatus(), chatSave: getChatSaveStatus(), settingsGet: getSettingsGetStatus() });
+    sendJson4(res, { ok: true, stats, status: getUserStatus(ctx), earlyBridge: getEarlyBridgeStatus(), settingsSave: getSettingsSaveStatus(), chatSave: getChatSaveStatus(), settingsGet: getSettingsGetStatus(), browserLogs: getBrowserLogStatus() });
   });
   router.post("/cache/clear", async (req, res) => {
     const endpointKeys = parseEndpointList(req.body?.endpoints, ["characters-all"]);

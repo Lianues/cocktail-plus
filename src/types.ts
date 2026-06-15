@@ -117,6 +117,34 @@ export type SettingsGetStatus = {
   };
 };
 
+export type BrowserLogEntry = {
+  id: number;
+  receivedAt: number;
+  level: string;
+  message: string;
+  args?: string[];
+  stack?: string;
+  pageUrl?: string;
+  source?: string;
+  line?: number | null;
+  column?: number | null;
+  userAgent?: string;
+  user?: string;
+};
+
+export type BrowserLogStatus = {
+  total: number;
+  maxEntries: number;
+  lastReceivedAt: number | null;
+};
+
+export type BrowserLogList = BrowserLogStatus & {
+  ok: boolean;
+  version: string;
+  entries: BrowserLogEntry[];
+  text: string;
+};
+
 export type UpdateStatus = {
   checking: boolean;
   checked: boolean;
@@ -147,6 +175,7 @@ export type BackendProbe = {
   settingsGet?: SettingsGetStatus;
   settingsSave?: SettingsSaveStatus;
   chatSave?: ChatSaveStatus;
+  browserLogs?: BrowserLogStatus;
   serviceWorker?: { enabled: boolean; url: string; scope: string };
   earlyBridge?: EarlyBridgeStatus;
 };

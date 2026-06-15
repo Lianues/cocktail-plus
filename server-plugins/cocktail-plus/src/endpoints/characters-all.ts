@@ -296,7 +296,7 @@ function transformBodyForCache(ctx, bodyText, config) {
 }
 
 function makeAsyncMiss(ctx, signature, config) {
-    if (!config.asyncCharactersAllOnMiss) return null;
+    if (!config.asyncCharactersAllOnMiss || !config.allowEmptyCharactersAllOnMiss) return null;
     return {
         state: 'ASYNC-MISS',
         status: 200,

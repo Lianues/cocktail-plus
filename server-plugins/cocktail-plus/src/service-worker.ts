@@ -584,6 +584,7 @@ async function handleTemplateFallback(request) {
   }
 }
 
+
 function endpointsToInvalidate(pathname) {
   const out = [];
   if (pathname.startsWith('/api/characters/') && pathname !== '/api/characters/all' && pathname !== '/api/characters/get' && pathname !== '/api/characters/chats') out.push('characters-all');
@@ -622,6 +623,7 @@ self.addEventListener('fetch', (event) => {
   if (!sameOrigin(url)) return;
 
   const pathname = url.pathname;
+
 
   if (TEMPLATE_FALLBACK.enabled && request.method === 'GET' && isTemplatePath(pathname)) {
     event.respondWith(handleTemplateFallback(request));

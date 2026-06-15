@@ -1,4 +1,4 @@
-import type { BackendProbe, LocalSettings, ServiceWorkerState, UpdateStatus } from './types';
+import type { BackendProbe, BrowserLogList, LocalSettings, ServiceWorkerState, UpdateStatus } from './types';
 
 export const DEFAULT_LOCAL_SETTINGS: LocalSettings = {
   autoRegisterServiceWorker: true,
@@ -28,6 +28,7 @@ export const state: {
   backend: BackendProbe | null;
   update: UpdateStatus;
   sw: ServiceWorkerState;
+  browserLogs: BrowserLogList | null;
   busy: boolean;
   localSettings: LocalSettings;
 } = {
@@ -40,6 +41,7 @@ export const state: {
     scriptURL: '',
     scope: '',
   },
+  browserLogs: null,
   busy: false,
   localSettings: { ...DEFAULT_LOCAL_SETTINGS },
 };

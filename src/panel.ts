@@ -1,4 +1,4 @@
-import { clearCache, fullProbe, installEarlyBridge, refreshEarlyBridgeStatus, uninstallEarlyBridge, warm } from './api';
+import { clearBrowserLogs, clearCache, fullProbe, installEarlyBridge, refreshBrowserLogs, refreshEarlyBridgeStatus, uninstallEarlyBridge, warm } from './api';
 import { DISPLAY_NAME, DRAWER_ID, ROOT_ID } from './constants';
 import { registerServiceWorker, unregisterServiceWorker } from './service-worker';
 import { log } from './st-context';
@@ -294,6 +294,28 @@ function renderChatSaveStats() {
   `;
 }
 
+function renderBrowserLogsSection() {
+  const status = state.backend?.browserLogs;
+  const logs = state.browserLogs;
+  const text = logs?.text || '';
+  const entries = logs?.entries || [];
+  const last = status?.lastReceivedAt ? fmtTime(status.lastReceivedAt) : '-';
+  return `
+    <div class="cp-section">
+      <b>浏览器日志接管</b>
+      <div class="cp-muted">Early Bridge 会捕获浏览器 <code>console.*</code>、<code>window.onerror</code>、<code>unhandledrejection</code> 并上报到后端环形缓存。错误/警告也会在后端终端打印，方便没有浏览器控制台时复制。</div>
+      <div class="cp-muted">后端缓存：${status ? `${status.total}/${status.maxEntries}` : '-'}；最近接收：${last}；当前显示：${entries.length} 条</div>
+      <div class="cp-actions cp-actions-top">
+        <button id="cp_browser_logs_refresh" class="menu_button" ${state.backend?.ok ? '' : 'disabled'}>刷新日志</button>
+        <button id="cp_browser_logs_copy" class="menu_button" ${text ? '' : 'disabled'}>复制日志</button>
+        <button id="cp_browser_logs_clear" class="menu_button" ${state.backend?.ok ? '' : 'disabled'}>清空日志</button>
+      </div>
+      <textarea id="cp_browser_logs_text" class="cp-command cp-browser-logs" rows="10" readonly>${escapeHtml(text || '暂无日志。点击“刷新日志”读取后端缓存。')}</textarea>
+    </div>
+  `;
+}
+
+
 
 export function renderPanel() {
   const root = ensurePanelShell();
@@ -352,6 +374,8 @@ export function renderPanel() {
       <b>chat/save 优化状态</b>
       ${renderChatSaveStats()}
     </div>
+
+    ${renderBrowserLogsSection()}
   `;
 
   bindPanelEvents(root);
@@ -372,9 +396,12 @@ function bindPanelEvents(root: HTMLElement) {
   onClick('cp_early_uninstall', uninstallEarlyBridge);
   onClick('cp_check_update', async () => { await checkForUpdates({ manual: true, prompt: true }); });
   onClick('cp_run_update', performUpdate);
+  onClick('cp_browser_logs_refresh', async () => { await refreshBrowserLogs(300); });
+  onClick('cp_browser_logs_clear', clearBrowserLogs);
   bindCopyCommand(root, 'cp_copy_windows_helper', 'cp_helper_windows_command');
   bindCopyCommand(root, 'cp_copy_windows_cmd_helper', 'cp_helper_windows_cmd_command');
   bindCopyCommand(root, 'cp_copy_unix_helper', 'cp_helper_unix_command');
+  bindCopyCommand(root, 'cp_browser_logs_copy', 'cp_browser_logs_text');
 
   const onLocalBool = (id: string, key: keyof LocalSettings) => {
     const el = root.querySelector<HTMLInputElement>(`#${id}`);

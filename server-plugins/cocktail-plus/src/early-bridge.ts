@@ -312,6 +312,11 @@ ${fastRoutes}
     maxPatchBytesRatio: ${JSON.stringify(config.chatSaveMaxPatchBytesRatio)},
     maxBaselines: ${JSON.stringify(config.chatSaveCacheMaxEntries)}
   };
+  var BROWSER_LOGS = {
+    enabled: ${JSON.stringify(!!config.browserLogCaptureEnabled)},
+    ingestPath: PREFIX + '/browser-logs/ingest',
+    beaconPath: PREFIX + '/browser-logs/beacon'
+  };
   var FLAG = '__cocktailPlusEarlyBridge';
   var state = window[FLAG] = window[FLAG] || { version: VERSION, installedAt: Date.now(), events: [], patchedFetch: false, swRegisterStarted: false, settingsSave: { baselineHash: '', captures: 0, optimized: 0, fallbacks: 0, savedBytes: 0 }, chatSave: { baselineCount: 0, captures: 0, optimized: 0, fallbacks: 0, savedBytes: 0, evictions: 0 } };
   state.settingsSave = state.settingsSave || { baselineHash: '', captures: 0, optimized: 0, fallbacks: 0, savedBytes: 0 };
@@ -848,15 +853,173 @@ ${fastRoutes}
   var fastGetPrefetches = new Map();
   var extensionDiscoverPrefetch = null;
   var extensionManifestPrefetches = new Map();
+  var extensionResourcePreloads = new Set();
+  var charactersAllWarmPrefetch = null;
   var backgroundsAllPrefetch = null;
   var groupsAllPrefetch = null;
+
+  function cpShouldPrintEarlyEvent(type) {
+    var text = String(type || '');
+    return /(?:error|throw|failed|not-proxied|disabled|browser-log\.capture-installed|fetch\.patch-disabled|module\.main-entry-not-proxied)/i.test(text);
+  }
 
   function remember(type, detail) {
     var item = { t: Date.now(), type: type, detail: detail || {} };
     state.events.push(item);
     if (state.events.length > 100) state.events.shift();
-    try { console.info('[cocktail-plus:early] ' + type, detail || ''); } catch (_) {}
+    if (cpShouldPrintEarlyEvent(type)) {
+      try { console.info('[cocktail-plus:early] ' + type, detail || ''); } catch (_) {}
+    }
     try { window.dispatchEvent(new CustomEvent('cocktail-plus:early', { detail: item })); } catch (_) {}
+  }
+
+  function cpClipLogText(value, max) {
+    var text = String(value === undefined ? 'undefined' : value === null ? 'null' : value);
+    var limit = max || 3000;
+    return text.length > limit ? text.slice(0, limit) + '…<truncated ' + (text.length - limit) + '>' : text;
+  }
+
+  function cpSerializeLogArg(value) {
+    try {
+      if (value instanceof Error) return cpClipLogText((value.name || 'Error') + ': ' + (value.message || '') + '\\n' + (value.stack || ''));
+      if (typeof value === 'string') return cpClipLogText(value);
+      if (value === undefined) return 'undefined';
+      if (value === null) return 'null';
+      if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+      return cpClipLogText(JSON.stringify(value));
+    } catch (_) {
+      try { return cpClipLogText(Object.prototype.toString.call(value)); } catch (_) { return '[unserializable]'; }
+    }
+  }
+
+  function cpSendBrowserLogBeacon(entry) {
+    try {
+      if (!BROWSER_LOGS.enabled || !BROWSER_LOGS.beaconPath) return;
+      var payload = {
+        level: cpClipLogText(entry && entry.level || 'log', 40),
+        message: cpClipLogText(entry && entry.message || (entry && entry.args ? entry.args.join(' ') : ''), 900),
+        args: Array.isArray(entry && entry.args) ? entry.args.slice(0, 4).map(function (x) { return cpClipLogText(x, 700); }) : [],
+        stack: cpClipLogText(entry && entry.stack || '', 1000),
+        pageUrl: location.href,
+        source: cpClipLogText(entry && entry.source || 'early-beacon', 200),
+        line: entry && entry.line || null,
+        column: entry && entry.column || null,
+        timestamp: entry && entry.timestamp || Date.now(),
+      };
+      var json = JSON.stringify(payload);
+      if (json.length > 1800) {
+        payload.args = [];
+        payload.stack = cpClipLogText(payload.stack, 300);
+        payload.message = cpClipLogText(payload.message, 700);
+        json = JSON.stringify(payload);
+      }
+      var url = BROWSER_LOGS.beaconPath + '?t=' + Date.now() + '&d=' + encodeURIComponent(json);
+      if (url.length > 3900) {
+        url = BROWSER_LOGS.beaconPath + '?t=' + Date.now() + '&level=' + encodeURIComponent(payload.level) + '&message=' + encodeURIComponent(cpClipLogText(payload.message, 1200));
+      }
+      var img = new Image();
+      img.referrerPolicy = 'no-referrer-when-downgrade';
+      img.src = url;
+    } catch (_) {}
+  }
+
+  function cpInstallBrowserLogCapture() {
+    if (!BROWSER_LOGS.enabled || state.browserLogCaptureInstalled) return;
+    state.browserLogCaptureInstalled = true;
+    state.browserLogQueue = state.browserLogQueue || [];
+    state.browserLogSending = false;
+    state.browserLogFlushTimer = null;
+    state.browserLogSeq = state.browserLogSeq || 1;
+    var rawConsole = {};
+    ['debug', 'log', 'info', 'warn', 'error', 'trace'].forEach(function (level) {
+      try { rawConsole[level] = console[level] && console[level].bind(console); } catch (_) {}
+    });
+
+    function enqueue(level, argsLike, extra) {
+      try {
+        var args = Array.prototype.slice.call(argsLike || []).map(cpSerializeLogArg);
+        var message = args.join(' ');
+        if (message.indexOf('[cocktail-plus:browser-log-send]') !== -1) return;
+        if (message.indexOf('[cocktail-plus:early]') === 0 && !/(error|warn|failed|not-proxied|browser-log)/i.test(message)) return;
+        if (message.indexOf('[cocktail-plus:route-diag]') === 0 || message.indexOf('[cocktail-plus:module-diag]') === 0 || message.indexOf('[cocktail-plus:fast-diag]') === 0) return;
+        var entry = Object.assign({
+          seq: state.browserLogSeq++,
+          level: level,
+          args: args,
+          message: cpClipLogText(message),
+          stack: '',
+          pageUrl: location.href,
+          userAgent: navigator.userAgent,
+          timestamp: Date.now(),
+        }, extra || {});
+        state.browserLogQueue.push(entry);
+        while (state.browserLogQueue.length > 300) state.browserLogQueue.shift();
+        if (level === 'warn' || level === 'error' || level === 'window-error' || level === 'unhandledrejection') {
+          cpSendBrowserLogBeacon(entry);
+        }
+        scheduleFlush();
+      } catch (_) {}
+    }
+
+    function scheduleFlush() {
+      if (state.browserLogFlushTimer) return;
+      state.browserLogFlushTimer = setTimeout(function () {
+        state.browserLogFlushTimer = null;
+        flush();
+      }, 800);
+    }
+
+    function getLogHeaders() {
+      var headers = new Headers();
+      headers.set('content-type', 'application/json');
+      headers.set(HEADER_PREFIX + '-early', VERSION);
+      if (settingsGetCsrfToken) headers.set('x-csrf-token', settingsGetCsrfToken);
+      return headers;
+    }
+
+    async function flush() {
+      if (state.browserLogSending || !state.browserLogQueue.length) return;
+      if (!settingsGetCsrfToken) { scheduleFlush(); return; }
+      var fetcher = state.rawFetch || (typeof window.fetch === 'function' ? window.fetch.bind(window) : null);
+      if (!fetcher) { scheduleFlush(); return; }
+      state.browserLogSending = true;
+      var batch = state.browserLogQueue.splice(0, 80);
+      try {
+        await fetcher(BROWSER_LOGS.ingestPath, {
+          method: 'POST',
+          headers: getLogHeaders(),
+          credentials: 'same-origin',
+          cache: 'no-store',
+          body: JSON.stringify({ entries: batch }),
+        });
+      } catch (_) {
+        state.browserLogQueue = batch.concat(state.browserLogQueue).slice(-300);
+      } finally {
+        state.browserLogSending = false;
+        if (state.browserLogQueue.length) scheduleFlush();
+      }
+    }
+
+    ['debug', 'log', 'info', 'warn', 'error', 'trace'].forEach(function (level) {
+      try {
+        var raw = rawConsole[level];
+        if (typeof raw !== 'function') return;
+        console[level] = function cpConsoleCapture() {
+          try { raw.apply(console, arguments); } catch (_) {}
+          enqueue(level, arguments);
+        };
+      } catch (_) {}
+    });
+
+    window.addEventListener('error', function (event) {
+      enqueue('window-error', [event.message || 'window error'], { source: event.filename || '', line: event.lineno || null, column: event.colno || null, stack: event.error && event.error.stack || '' });
+    });
+    window.addEventListener('unhandledrejection', function (event) {
+      var reason = event.reason;
+      enqueue('unhandledrejection', [reason && reason.message ? reason.message : reason], { stack: reason && reason.stack || '' });
+    });
+    state.flushBrowserLogs = flush;
+    remember('browser-log.capture-installed', { enabled: true });
   }
 
   state.startupMarks = state.startupMarks || [];
@@ -1461,6 +1624,64 @@ ${fastRoutes}
     } catch (_) { return ''; }
   }
 
+  function extensionAssetPathForName(name, asset) {
+    try {
+      if (!name || typeof name !== 'string' || !asset || typeof asset !== 'string') return '';
+      var raw = String(asset || '').trim();
+      if (!raw) return '';
+      var protocolIndex = raw.indexOf('://');
+      if (raw.indexOf('//') === 0 || protocolIndex > 0) return '';
+      if (raw.charAt(0) === '/') return raw;
+      var encodedName = name.split('/').map(encodeURIComponent).join('/');
+      var encodedAsset = raw.split('/').map(encodeURIComponent).join('/');
+      return '/scripts/extensions/' + encodedName + '/' + encodedAsset;
+    } catch (_) { return ''; }
+  }
+
+  function addExtensionResourcePreload(href, rel, asValue) {
+    try {
+      if (!href || extensionResourcePreloads.has(rel + ':' + href)) return;
+      extensionResourcePreloads.add(rel + ':' + href);
+      if (document.querySelectorAll) {
+        var existing = document.querySelectorAll('link[data-cocktail-plus-extension-preload]');
+        for (var i = 0; i < existing.length; i++) {
+          try {
+            if (existing[i] && existing[i].href === new URL(href, location.href).href) return;
+          } catch (_) {
+            if (existing[i] && existing[i].getAttribute && existing[i].getAttribute('href') === href) return;
+          }
+        }
+      }
+      var link = document.createElement('link');
+      link.rel = rel;
+      if (asValue) link.as = asValue;
+      link.href = href;
+      link.dataset.cocktailPlusExtensionPreload = '1';
+      (document.head || document.documentElement).appendChild(link);
+      remember('extensions.resource-preload', { rel: rel, as: asValue || '', href: href });
+    } catch (error) {
+      remember('extensions.resource-preload-error', { href: href || '', error: String(error && error.message || error) });
+    }
+  }
+
+  function preloadExtensionResources(name, manifest) {
+    try {
+      if (!EXTENSION_PRELOAD.enabled || !manifest || typeof manifest !== 'object') return;
+      var js = typeof manifest.js === 'string' ? manifest.js : '';
+      var css = typeof manifest.css === 'string' ? manifest.css : '';
+      if (js) {
+        var jsHref = extensionAssetPathForName(name, js);
+        if (jsHref) addExtensionResourcePreload(jsHref, 'modulepreload', 'script');
+      }
+      if (css) {
+        var cssHref = extensionAssetPathForName(name, css);
+        if (cssHref) addExtensionResourcePreload(cssHref, 'preload', 'style');
+      }
+    } catch (error) {
+      remember('extensions.resource-preload-list-error', { name: name, error: String(error && error.message || error) });
+    }
+  }
+
   function startExtensionManifestPrefetch(rawFetch, name) {
     if (!EXTENSION_PRELOAD.enabled || !rawFetch || !name) return null;
     var pathname = manifestPathForExtensionName(name);
@@ -1468,7 +1689,6 @@ ${fastRoutes}
     var existing = extensionManifestPrefetches.get(pathname);
     if (existing) return existing.promise;
     var record = { ok: false, path: pathname, state: 'pending', promise: null, text: '', status: 0, statusText: '', headers: [], error: null, startedAt: Date.now(), finishedAt: 0, durationMs: 0 };
-    remember('extensions.manifest.prefetch-start-one', { path: pathname });
     record.promise = rawFetch(pathname, { method: 'GET', credentials: 'same-origin', cache: 'force-cache', redirect: 'manual' })
       .then(async function (response) {
         record.ok = !!response.ok;
@@ -1480,6 +1700,13 @@ ${fastRoutes}
         record.finishedAt = Date.now();
         record.durationMs = record.finishedAt - record.startedAt;
         if (!response.ok) record.error = 'HTTP ' + response.status;
+        if (response.ok && record.text) {
+          try {
+            preloadExtensionResources(name, JSON.parse(record.text));
+          } catch (error) {
+            remember('extensions.resource-preload-parse-error', { name: name, path: pathname, error: String(error && error.message || error) });
+          }
+        }
         return record;
       })
       .catch(function (error) {
@@ -1534,9 +1761,29 @@ ${fastRoutes}
       if (!record || !record.promise) return null;
       var ready = await record.promise;
       if (!ready || ready.state !== 'ready' || !ready.text) return null;
-      return JSON.parse(ready.text);
+      var manifest = JSON.parse(ready.text);
+      preloadExtensionResources(name, manifest);
+      return manifest;
     } catch (error) {
       remember('extensions.manifest.get-prefetch-error', { name: name, error: String(error && error.message || error) });
+      return null;
+    }
+  };
+
+  state.getExtensionDiscover = async function getExtensionDiscover() {
+    try {
+      var fetcher = state.rawFetch;
+      if (!fetcher && !state.patchedFetch && typeof window.fetch === 'function') fetcher = window.fetch.bind(window);
+      if (!extensionDiscoverPrefetch && fetcher) startExtensionDiscoverPrefetch(fetcher, 'discover-getter');
+      if (!extensionDiscoverPrefetch) return null;
+      var ready = await extensionDiscoverPrefetch;
+      if (!ready || !ready.ok || !ready.text) return null;
+      var list = JSON.parse(ready.text);
+      if (!Array.isArray(list)) return null;
+      remember('extensions.discover.get-prefetch-hit', { count: list.length, durationMs: ready.durationMs });
+      return list;
+    } catch (error) {
+      remember('extensions.discover.get-prefetch-error', { error: String(error && error.message || error) });
       return null;
     }
   };
@@ -1589,6 +1836,38 @@ ${fastRoutes}
       }
     })();
     return groupsAllPrefetch;
+  }
+
+  function startCharactersAllWarm(rawFetch, token) {
+    if (!STARTUP_PRELOAD.enabled || !rawFetch || !token) return null;
+    if (charactersAllWarmPrefetch) return charactersAllWarmPrefetch;
+    charactersAllWarmPrefetch = (async function () {
+      var startedAt = Date.now();
+      try {
+        remember('characters.all.warm-start');
+        var headers = new Headers();
+        headers.set('content-type', 'application/json');
+        headers.set('x-csrf-token', token);
+        headers.set(HEADER_PREFIX + '-early', VERSION);
+        var response = await rawFetch(PREFIX + '/warm', {
+          method: 'POST',
+          headers: headers,
+          credentials: 'same-origin',
+          cache: 'no-store',
+          redirect: 'manual',
+          body: JSON.stringify({ endpoints: ['characters-all'], wait: false, force: false })
+        });
+        var text = await response.text();
+        var record = makeApiRecordFromResponse(response, text, startedAt);
+        remember(record.ok ? 'characters.all.warm-ready' : 'characters.all.warm-bad-status', { status: record.status, durationMs: record.durationMs });
+        return record;
+      } catch (error) {
+        var record = { ok: false, error: String(error && error.message || error), durationMs: Date.now() - startedAt };
+        remember('characters.all.warm-error', record);
+        return record;
+      }
+    })();
+    return charactersAllWarmPrefetch;
   }
 
   async function consumePrefetchRecord(promise, label, startedAt) {
@@ -1668,6 +1947,8 @@ ${fastRoutes}
             if (settingsGetCsrfToken) startSettingsGetPrefetch(rawFetch, settingsGetCsrfToken);
             if (settingsGetCsrfToken) startBackgroundsAllPrefetch(rawFetch, settingsGetCsrfToken);
             if (settingsGetCsrfToken) startGroupsAllPrefetch(rawFetch, settingsGetCsrfToken);
+            if (settingsGetCsrfToken) startCharactersAllWarm(rawFetch, settingsGetCsrfToken);
+            if (settingsGetCsrfToken) state.flushBrowserLogs?.();
           } catch (_) {}
           remember('csrf.prefetch-ready', { status: record.status, durationMs: record.durationMs, startedSettingsGet: !!settingsGetPrefetch });
         } else {
@@ -1710,6 +1991,8 @@ ${fastRoutes}
       if (settingsGetCsrfToken) startSettingsGetPrefetch(rawFetch, settingsGetCsrfToken);
       if (settingsGetCsrfToken) startBackgroundsAllPrefetch(rawFetch, settingsGetCsrfToken);
       if (settingsGetCsrfToken) startGroupsAllPrefetch(rawFetch, settingsGetCsrfToken);
+      if (settingsGetCsrfToken) startCharactersAllWarm(rawFetch, settingsGetCsrfToken);
+      if (settingsGetCsrfToken) state.flushBrowserLogs?.();
     } catch (error) {
       remember('settings.get.csrf-capture-error', { error: String(error && error.message || error) });
     }
@@ -2536,6 +2819,8 @@ ${fastRoutes}
   async function callFast(rawFetch, input, init, route, url, method) {
     var startedAt = Date.now();
     var isCharactersAll = url && url.pathname === '/api/characters/all';
+    var cpCharactersAllSlowTimer = null;
+    var cpCharactersAllVerySlowTimer = null;
     if (method === 'GET') {
       var prefetched = fastGetPrefetches.get(url.pathname);
       if (prefetched && prefetched.promise) {
@@ -2553,6 +2838,9 @@ ${fastRoutes}
     if (method !== 'GET' && method !== 'HEAD' && !headers.has('content-type')) headers.set('content-type', 'application/json');
 
     if (isCharactersAll) {
+      remember('intercept.characters-all.enter', { fastPath: route.path, method: method, controller: navigator.serviceWorker && navigator.serviceWorker.controller && navigator.serviceWorker.controller.scriptURL || '' });
+      cpCharactersAllSlowTimer = setTimeout(function () { remember('intercept.characters-all.waiting-over-500ms', { fastPath: route.path, elapsedMs: Date.now() - startedAt }); }, 500);
+      cpCharactersAllVerySlowTimer = setTimeout(function () { remember('intercept.characters-all.waiting-over-2000ms', { fastPath: route.path, elapsedMs: Date.now() - startedAt }); }, 2000);
       cpUpdateCharacterProgress({ active: true, phase: 'requesting', cache: '', message: '正在加载角色列表…', bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, error: null, startedAt: startedAt });
       cpStartCharacterStatusPolling(rawFetch, headers);
     }
@@ -2568,6 +2856,8 @@ ${fastRoutes}
       if (route.method !== 'GET' && route.method !== 'HEAD' && body !== undefined) fastInit.body = body;
       var response = await rawFetch(route.path, fastInit);
       if (response && response.status !== 404 && response.status !== 503) {
+        if (cpCharactersAllSlowTimer) { clearTimeout(cpCharactersAllSlowTimer); cpCharactersAllSlowTimer = null; }
+        if (cpCharactersAllVerySlowTimer) { clearTimeout(cpCharactersAllVerySlowTimer); cpCharactersAllVerySlowTimer = null; }
         var cacheState = response.headers.get(HEADER_PREFIX + '-state') || response.headers.get('x-cocktail-cache') || '';
         if (isCharactersAll) {
           cpUpdateCharacterProgress({ phase: cacheState === 'ASYNC-MISS' ? 'requesting' : 'rendering', cache: cacheState, status: response.status, percent: cacheState === 'ASYNC-MISS' ? null : 100, etaMs: 0, message: cacheState === 'ASYNC-MISS' ? '后端正在构建角色缓存，首次加载可能较久…' : '角色数据已返回，正在解析并渲染列表…' });
@@ -2577,11 +2867,16 @@ ${fastRoutes}
           }
         }
         remember('intercept.fast-response', { path: url.pathname, status: response.status, cache: cacheState, durationMs: Date.now() - startedAt });
+        if (isCharactersAll) remember('intercept.characters-all.fast-return', { status: response.status, cache: cacheState, durationMs: Date.now() - startedAt, async: response.headers.get(HEADER_PREFIX + '-async') || '' });
         return response;
       }
+      if (cpCharactersAllSlowTimer) { clearTimeout(cpCharactersAllSlowTimer); cpCharactersAllSlowTimer = null; }
+      if (cpCharactersAllVerySlowTimer) { clearTimeout(cpCharactersAllVerySlowTimer); cpCharactersAllVerySlowTimer = null; }
       if (isCharactersAll) cpUpdateCharacterProgress({ phase: 'requesting', message: '快速接口不可用，回退原始角色接口…' });
       remember('intercept.fallback-status', { path: url.pathname, status: response && response.status, durationMs: Date.now() - startedAt });
     } catch (error) {
+      if (cpCharactersAllSlowTimer) { clearTimeout(cpCharactersAllSlowTimer); cpCharactersAllSlowTimer = null; }
+      if (cpCharactersAllVerySlowTimer) { clearTimeout(cpCharactersAllVerySlowTimer); cpCharactersAllVerySlowTimer = null; }
       if (isCharactersAll) cpUpdateCharacterProgress({ phase: 'error', error: String(error && error.message || error), message: '快速接口请求失败，正在回退原始角色接口…' });
       remember('intercept.error', { path: url.pathname, error: String(error && error.message || error), durationMs: Date.now() - startedAt });
     }
@@ -2623,6 +2918,7 @@ ${fastRoutes}
         if (recentChatsResponse) return recentChatsResponse;
       }
       if (url && url.origin === location.origin && url.pathname === '/api/extensions/discover' && method === 'GET') {
+        if (!extensionDiscoverPrefetch) startExtensionDiscoverPrefetch(rawFetch, 'fetch-intercept');
         var extensionResponse = await consumePrefetchRecord(extensionDiscoverPrefetch, 'extensions.discover', Date.now());
         if (extensionResponse) return extensionResponse;
       }
@@ -2695,6 +2991,7 @@ ${fastRoutes}
   }
 
   if (!BRIDGE_ENABLED) { remember('disabled', { version: VERSION }); return; }
+  cpInstallBrowserLogCapture();
   installModuleImportMapIfMissing();
   patchModuleScripts();
   checkMainModuleProxyStatus('bridge-ready');

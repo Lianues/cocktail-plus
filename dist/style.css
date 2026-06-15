@@ -134,3 +134,9 @@
   line-height: 1.35;
 }
 
+
+
+#cocktail-plus-panel-root .cp-browser-logs {
+  min-height: 180px;
+  white-space: pre;
+}

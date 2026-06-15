@@ -20,6 +20,7 @@ import { handleModuleProxy } from './module-proxy.js';
 import { getDataRoot, getServerRoot } from './utils.js';
 import { applyChatsEnoentPatch, getChatsEnoentPatchStatus, revertChatsEnoentPatch } from './source-patches.js';
 import { handleFrontendUpdate } from './frontend-update.js';
+import { clearBrowserLogs, getBrowserLogs, getBrowserLogStatus, ingestBrowserLogBeacon, ingestBrowserLogs } from './browser-logs.js';
 
 function sendJson(res, data) {
     res.setHeader(HEADER_PREFIX, VERSION);
@@ -58,6 +59,7 @@ export function registerRoutes(router) {
             settingsSave: getSettingsSaveStatus(),
             chatSave: getChatSaveStatus(),
             settingsGet: getSettingsGetStatus(),
+            browserLogs: getBrowserLogStatus(),
         });
     });
 
@@ -72,6 +74,7 @@ export function registerRoutes(router) {
         res.send(makeServiceWorkerScript());
     });
     router.get('/early/bridge.js', async (_req, res) => {
+        console.info('[cocktail-plus:route-diag] serving early bridge', { version: VERSION, earlyBridgeEnabled: !!config.earlyBridgeEnabled, moduleProxyEnabled: !!config.moduleProxyEnabled, patchStartupInit: !!config.patchStartupInit });
         if (!config.earlyBridgeEnabled) {
             res.setHeader('content-type', 'application/javascript; charset=utf-8');
             res.setHeader('cache-control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -122,6 +125,29 @@ export function registerRoutes(router) {
 
     router.post('/update/frontend', async (req, res) => handleFrontendUpdate(req, res));
 
+    router.post('/browser-logs/ingest', async (req, res) => {
+        sendJson(res, ingestBrowserLogs(req));
+    });
+
+    router.get('/browser-logs/beacon', async (req, res) => {
+        ingestBrowserLogBeacon(req);
+        res.sendStatus(204);
+    });
+
+    router.post('/browser-logs/list', async (req, res) => {
+        sendJson(res, getBrowserLogs(req.body?.limit));
+    });
+
+    router.get('/browser-logs/text', async (req, res) => {
+        const result = getBrowserLogs(req.query?.limit);
+        res.setHeader(HEADER_PREFIX, VERSION);
+        res.type('text/plain; charset=utf-8').send(result.text);
+    });
+
+    router.post('/browser-logs/clear', async (_req, res) => {
+        sendJson(res, clearBrowserLogs());
+    });
+
     router.post('/source-patches/chats-enoent/apply', async (req, res) => {
         const result = applyChatsEnoentPatch();
         sendJson(res, result);
@@ -170,7 +196,7 @@ export function registerRoutes(router) {
 
     router.post('/status', async (req, res) => {
         const ctx = makeRequestContext(req, { bodyOverride: {} });
-        sendJson(res, { ok: true, stats, status: getUserStatus(ctx), earlyBridge: getEarlyBridgeStatus(), settingsSave: getSettingsSaveStatus(), chatSave: getChatSaveStatus(), settingsGet: getSettingsGetStatus() });
+        sendJson(res, { ok: true, stats, status: getUserStatus(ctx), earlyBridge: getEarlyBridgeStatus(), settingsSave: getSettingsSaveStatus(), chatSave: getChatSaveStatus(), settingsGet: getSettingsGetStatus(), browserLogs: getBrowserLogStatus() });
     });
 
     router.post('/cache/clear', async (req, res) => {

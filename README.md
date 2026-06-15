@@ -7,9 +7,13 @@
 ```text
 GET  /version
 POST /api/characters/all
+POST /api/settings/get
+POST /api/settings/save
+POST /api/chats/save
+POST /api/chats/group/save
 ```
 
-`/api/settings/get` 的拦截和缓存逻辑已经移除，settings 暂时保持 SillyTavern 原样。
+默认极速兼容模式下，`/api/characters/all` 首次无缓存会先返回空列表进入主页面，同时后台构建浅层角色缓存；模块代理会临时跳过原生自动加载聊天的“空列表重置”逻辑，并在角色缓存刷新后恢复打开上次角色。为避免旧版 `config.json` 残留慢速设置，除非显式设置 `blockCharactersAllOnMiss: true`，否则都会强制走极速首屏。
 
 ## 当前优化策略
 
@@ -63,10 +67,12 @@ SillyTavern/public/index.html
 
 它会被插在 `<head>` 后面，早于 `script.js` 执行。桥接脚本只做通用入口，后续功能由后端 `/early/bridge.js` 输出更新，不需要每次修改 HTML。
 
-当前 Early Bridge 做两件事：
+当前 Early Bridge 主要做这些事：
 
 - 尽早注册 `/api/plugins/cocktail-plus/sw.js`。
-- 在 `script.js` 前 patch `window.fetch`，把 `/version`、`/api/characters/all` 改道到后端 fast endpoints。这样即使 Service Worker 当前页面还没接管，首次页面加载也能生效。
+- 在 `script.js` 前 patch `window.fetch`，把 `/version`、`/api/characters/all`、settings/chat save 等路径改道到后端 fast endpoints。这样即使 Service Worker 当前页面还没接管，首次页面加载也能生效。
+- 提前 discover/读取扩展 manifest，并对扩展 JS/CSS 做 `modulepreload` / `preload as=style`，只预取资源，不提前执行扩展。
+- 前端扩展激活仍由 SillyTavern 的 `loadExtensionSettings()` 负责等待完成；并行激活只加速加载，不再延后到 `APP_READY` 后，避免错过 `EXTENSION_SETTINGS_LOADED` / `SETTINGS_LOADED`。
 
 ## 缓存目录
 

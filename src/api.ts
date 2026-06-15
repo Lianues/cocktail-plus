@@ -2,7 +2,7 @@ import { API_PREFIX } from './constants';
 import { getRequestHeaders, log } from './st-context';
 import { refreshServiceWorkerState } from './service-worker';
 import { state } from './state';
-import type { BackendProbe } from './types';
+import type { BackendProbe, BrowserLogList } from './types';
 
 export async function postJson<T>(url: string, body: unknown = {}): Promise<T> {
   const response = await fetch(url, {
@@ -74,4 +74,18 @@ export async function fullProbe() {
   log('fullProbe.start', { controller: navigator.serviceWorker?.controller?.scriptURL || '', readyState: document.readyState });
   await Promise.allSettled([probeBackend(), refreshServiceWorkerState()]);
   log('fullProbe.end', { backendOk: !!state.backend?.ok, sw: state.sw });
+}
+
+
+export async function refreshBrowserLogs(limit = 200) {
+  if (!state.backend?.ok) return null;
+  const result = await postJson<BrowserLogList>(`${API_PREFIX}/browser-logs/list`, { limit });
+  state.browserLogs = result;
+  if (state.backend) state.backend.browserLogs = { total: result.total, maxEntries: result.maxEntries, lastReceivedAt: result.lastReceivedAt };
+  return result;
+}
+
+export async function clearBrowserLogs() {
+  await postJson(`${API_PREFIX}/browser-logs/clear`, {});
+  await refreshBrowserLogs();
 }

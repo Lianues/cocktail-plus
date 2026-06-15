@@ -121,10 +121,14 @@ function patchScriptJs(source) {
     ].join('\n'));
     if (config.patchStartupInit) out = out.replace(coreDataRegex, (_match, indent) => [
         `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.before-core-data-parallel');`,
-        `${indent}const userAvatarsPromise = getUserAvatars(true, user_avatar);`,
-        `${indent}const charactersPromise = getCharacters();`,
-        `${indent}const backgroundsPromise = getBackgrounds();`,
-        `${indent}const tokenizersPromise = initTokenizers();`,
+        `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.before-getUserAvatars');`,
+        `${indent}const userAvatarsPromise = getUserAvatars(true, user_avatar).finally(() => globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.after-getUserAvatars'));`,
+        `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.before-getCharacters');`,
+        `${indent}const charactersPromise = getCharacters().finally(() => globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.after-getCharacters', { cache: globalThis.__cocktailPlusEarlyBridge?.charactersLoad?.cache || '', phase: globalThis.__cocktailPlusEarlyBridge?.charactersLoad?.phase || '', count: Array.isArray(characters) ? characters.length : null }));`,
+        `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.before-getBackgrounds');`,
+        `${indent}const backgroundsPromise = getBackgrounds().finally(() => globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.after-getBackgrounds'));`,
+        `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.before-initTokenizers');`,
+        `${indent}const tokenizersPromise = initTokenizers().finally(() => globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.after-initTokenizers'));`,
         `${indent}await Promise.all([userAvatarsPromise, charactersPromise, backgroundsPromise, tokenizersPromise]);`,
         `${indent}globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.after-core-data-parallel');`,
     ].join('\n'));
@@ -160,6 +164,50 @@ function patchScriptJs(source) {
         `${indent}};`,
         `${indent}(globalThis.requestIdleCallback || function (cb) { return setTimeout(cb, 1); })(() => { void cpRunPostFirstPaintInit(); });`,
     ].join('\n'));
+    out = out.replace(/([ \t]*)initRossMods\(\);\s*\r?\n/, (_match, indent) => [
+        `${indent}const cpCharactersAsyncMissAtRossInit = globalThis.__cocktailPlusEarlyBridge?.charactersLoad?.cache === 'ASYNC-MISS';`,
+        `${indent}const cpAutoLoadChatSettingAtRossInit = !!power_user.auto_load_chat;`,
+        `${indent}if (cpCharactersAsyncMissAtRossInit && cpAutoLoadChatSettingAtRossInit) power_user.auto_load_chat = false;`,
+        `${indent}initRossMods();`,
+        `${indent}if (cpCharactersAsyncMissAtRossInit && cpAutoLoadChatSettingAtRossInit) {`,
+        `${indent}    power_user.auto_load_chat = cpAutoLoadChatSettingAtRossInit;`,
+        `${indent}    const cpRunAutoloadAfterCharactersReady = async () => {`,
+        `${indent}        if (globalThis.__cocktailPlusAutoLoadAfterAsyncMissDone) return;`,
+        `${indent}        globalThis.__cocktailPlusAutoLoadAfterAsyncMissDone = true;`,
+        `${indent}        try {`,
+        `${indent}            if (active_character !== null && active_character !== undefined) {`,
+        `${indent}                const activeCharacterId = characters.findIndex(x => getTagKeyForEntity(x) === active_character);`,
+        `${indent}                if (activeCharacterId !== -1) {`,
+        `${indent}                    await selectCharacterById(activeCharacterId);`,
+        `${indent}                    try { applyTagsOnCharacterSelect.call($('#rm_print_characters_block .character_select[chid="' + activeCharacterId + '"]')); } catch (_) {}`,
+        `${indent}                } else {`,
+        `${indent}                    console.warn('[cocktail-plus] active character still not found after async characters refresh', active_character);`,
+        `${indent}                }`,
+        `${indent}            } else if (active_group !== null && active_group !== undefined) {`,
+        `${indent}                try { select_group_chats(String(active_group), false); } catch (_) {}`,
+        `${indent}            }`,
+        `${indent}        } catch (error) {`,
+        `${indent}            console.error('[cocktail-plus] async characters auto-load recovery failed', error);`,
+        `${indent}        }`,
+        `${indent}    };`,
+        `${indent}    try {`,
+        `${indent}        eventSource.once(event_types.CHARACTER_PAGE_LOADED, () => { void cpRunAutoloadAfterCharactersReady(); });`,
+        `${indent}    } catch (_) {}`,
+        `${indent}    setTimeout(() => { if (characters.length > 0) void cpRunAutoloadAfterCharactersReady(); }, 5000);`,
+        `${indent}}`,
+    ].join('\n') + '\n');
+    out = out.replace(
+        `export async function getCharacters() {\n    const response = await fetch('/api/characters/all', {`,
+        `export async function getCharacters() {\n    const cpGetCharactersStartedAt = performance.now();\n    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('getCharacters.enter');\n    const response = await fetch('/api/characters/all', {`,
+    );
+    out = out.replace(
+        `        characters.splice(0, characters.length);\n        const getData = await response.json();`,
+        `        characters.splice(0, characters.length);\n        const cpCharactersAllState = response.headers?.get?.('x-cocktail-plus-state') || response.headers?.get?.('x-cocktail-cache') || '';\n        const cpCharactersAllAsync = response.headers?.get?.('x-cocktail-plus-async') || '';\n        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('getCharacters.response-before-json', { status: response.status, state: cpCharactersAllState, async: cpCharactersAllAsync, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt) });\n        console.info('[cocktail-plus:diag] getCharacters response before json', { status: response.status, state: cpCharactersAllState, async: cpCharactersAllAsync, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt) });\n        const getData = await response.json();\n        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('getCharacters.response-json-parsed', { count: Array.isArray(getData) ? getData.length : null, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt) });`,
+    );
+    out = out.replace(
+        `        await printCharacters(true);\n    } else {`,
+        `        await printCharacters(true);\n        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('getCharacters.done', { count: characters.length, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt), state: cpCharactersAllState });\n        console.info('[cocktail-plus:diag] getCharacters done', { count: characters.length, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt), state: cpCharactersAllState });\n    } else {\n        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('getCharacters.non-ok', { status: response.status, durationMs: Math.round(performance.now() - cpGetCharactersStartedAt) });`,
+    );
     if (config.patchStartupInit && readyCallbackStartRegex.test(out)) {
         out = out.replace(readyCallbackStartRegex, (match) => `${match}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('ready-callback.enter');
 `);
@@ -172,10 +220,15 @@ function patchScriptJs(source) {
     patchFlags.readyFirstLoadStartedEarlyApplied = false;
     const firstLoadRegex = /(async\s+function\s+firstLoadInit\s*\(\s*\)\s*\{\r?\n)/;
     patchFlags.firstLoadDiagnosticInserted = config.patchStartupInit && firstLoadRegex.test(out);
+    patchFlags.cpGetCharactersDiagnosticsApplied = out.includes('getCharacters.response-before-json');
+    patchFlags.cpRossAutoloadGuardApplied = out.includes('cpCharactersAsyncMissAtRossInit');
     const diagnostic = JSON.stringify({ version: VERSION, ...patchFlags });
     if (patchFlags.firstLoadDiagnosticInserted) {
-        out = out.replace(firstLoadRegex, `$1    console.info('[cp:module-proxy] firstLoadInit patches active', ${diagnostic});\n    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.enter', ${diagnostic});\n`);
+        out = out.replace(firstLoadRegex, `$1    console.info('[cp:module-proxy] firstLoadInit patches active', ${diagnostic});\n    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('firstLoadInit.enter', ${diagnostic});\n    try {\n        [\n            event_types.EXTENSION_SETTINGS_LOADED,\n            event_types.SETTINGS_LOADED,\n            event_types.SETTINGS_UPDATED,\n        ].filter(Boolean).forEach(eventName => eventSource?.autoFireAfterEmit?.add?.(eventName));\n        globalThis.__cocktailPlusEarlyBridge?.markStartup?.('event-replay.enabled', { events: ['EXTENSION_SETTINGS_LOADED', 'SETTINGS_LOADED', 'SETTINGS_UPDATED'] });\n    } catch (error) {\n        console.warn('[cocktail-plus] event replay setup failed', error);\n    }\n`);
     }
+    try {
+        console.info('[cocktail-plus:module-diag] patchScriptJs', { version: VERSION, ...patchFlags });
+    } catch {}
     out += `\ntry { console.info('[cp:module-proxy] loaded /script.js', ${diagnostic}); } catch (_) {}\n`;
     return out;
 }
@@ -226,6 +279,7 @@ function patchSystemMessagesJs(source) {
 
 function patchExtensionsJs(source) {
     let out = source;
+    const before = out;
 
     if (config.patchExtensionManifests) {
         out = out.replace(
@@ -236,16 +290,30 @@ function patchExtensionsJs(source) {
 
     if (config.patchExtensionManifests) {
         out = out.replace(
+            `        const response = await fetch('/api/extensions/discover');\n\n        if (response.ok) {\n            const extensions = await response.json();\n            return extensions;\n        } else {\n            return [];\n        }`,
+            `        const prefetched = await globalThis.__cocktailPlusEarlyBridge?.getExtensionDiscover?.();\n        if (Array.isArray(prefetched)) {\n            globalThis.__cocktailPlusEarlyBridge?.markStartup?.('extensions.discover.prefetch-used', { count: prefetched.length });\n            return prefetched;\n        }\n        const response = await fetch('/api/extensions/discover');\n\n        if (response.ok) {\n            const extensions = await response.json();\n            return extensions;\n        } else {\n            return [];\n        }`,
+        );
+    }
+
+    if (config.patchExtensionManifests) {
+        out = out.replace(
             `    const extensions = await discoverExtensions();\n    extensionNames = extensions.map(x => x.name);\n    extensionTypes = Object.fromEntries(extensions.map(x => [x.name, x.type]));\n    manifests = await getManifests(extensionNames);`,
             `    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('loadExtensionSettings.before-discover');\n    const extensions = await discoverExtensions();\n    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('loadExtensionSettings.after-discover', { count: extensions.length });\n    extensionNames = extensions.map(x => x.name);\n    extensionTypes = Object.fromEntries(extensions.map(x => [x.name, x.type]));\n    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('loadExtensionSettings.before-getManifests', { count: extensionNames.length });\n    manifests = await getManifests(extensionNames);\n    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('loadExtensionSettings.after-getManifests', { count: Object.keys(manifests || {}).length });`,
         );
     }
 
-    if (config.patchParallelActivateExtensions) {
+    if (config.patchExtensionManifests && !out.includes('cpPrefetchedExtensions')) {
+        out = out.replace(
+            /async\s+function\s+discoverExtensions\s*\(\s*\)\s*\{\s*try\s*\{/,
+            (match) => `${match}\n        const cpPrefetchedExtensions = await globalThis.__cocktailPlusEarlyBridge?.getExtensionDiscover?.();\n        if (Array.isArray(cpPrefetchedExtensions)) {\n            globalThis.__cocktailPlusEarlyBridge?.markStartup?.('extensions.discover.prefetch-used', { count: cpPrefetchedExtensions.length });\n            return cpPrefetchedExtensions;\n        }`,
+        );
+    }
+
+    if (config.deferExtensionActivationUntilAppReady) {
         out = out.replace(
             /([ \t]*)await\s+activateExtensions\(\)\s*;?\s*\r?\n\1if\s*\(extension_settings\.autoConnect\s*&&\s*extension_settings\.apiUrl\)\s*\{\s*\r?\n\1[ \t]*connectToApi\(extension_settings\.apiUrl\);\s*\r?\n\1\}/,
             (_match, indent) => [
-                `${indent}const cpActivateExtensionsAfterFirstPaint = async () => {`,
+                `${indent}const cpActivateExtensionsAfterAppReady = async () => {`,
                 `${indent}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('extensions.activate.deferred-start');`,
                 `${indent}    try {`,
                 `${indent}        await activateExtensions();`,
@@ -257,26 +325,47 @@ function patchExtensionsJs(source) {
                 `${indent}    }`,
                 `${indent}};`,
                 `${indent}const cpScheduleExtensionActivation = () => {`,
-                `${indent}    const run = () => setTimeout(() => {`,
-                `${indent}        void cpActivateExtensionsAfterFirstPaint().catch(error => console.error('[cocktail-plus] deferred extension activation failed', error));`,
+                `${indent}    globalThis.__cocktailPlusEarlyBridge?.markStartup?.('extensions.activate.deferred-scheduled');`,
+                `${indent}    setTimeout(() => {`,
+                `${indent}        void cpActivateExtensionsAfterAppReady().catch(error => console.error('[cocktail-plus] deferred extension activation failed', error));`,
                 `${indent}    }, 0);`,
-                `${indent}    try {`,
-                `${indent}        eventSource.once(event_types.APP_READY, run);`,
-                `${indent}    } catch (_) {`,
-                `${indent}        run();`,
-                `${indent}    }`,
                 `${indent}};`,
-                `${indent}cpScheduleExtensionActivation();`,
+                `${indent}try {`,
+                `${indent}    eventSource.once(event_types.APP_READY, cpScheduleExtensionActivation);`,
+                `${indent}} catch (_) {`,
+                `${indent}    cpScheduleExtensionActivation();`,
+                `${indent}}`,
             ].join('\n'),
         );
     }
 
     if (config.patchParallelActivateExtensions) {
         out = out.replace(
-            `                const promise = addExtensionLocale(name, manifest).finally(() =>\n                    Promise.all([addExtensionScript(name, manifest), addExtensionStyle(name, manifest)]),\n                );\n                await promise\n                    .then(() => activeExtensions.add(name))\n                    .catch(err => {\n                        console.log('Could not activate extension', name, err);\n                        extensionLoadErrors.add(t\`Extension \"\${displayName}\" failed to load: \${err}\`);\n                    });\n                promises.push(promise);`,
-            `                const promise = addExtensionLocale(name, manifest).finally(() =>\n                    Promise.all([addExtensionScript(name, manifest), addExtensionStyle(name, manifest)]),\n                )\n                    .then(() => activeExtensions.add(name))\n                    .catch(err => {\n                        console.log('Could not activate extension', name, err);\n                        extensionLoadErrors.add(t\`Extension \"\${displayName}\" failed to load: \${err}\`);\n                    });\n                promises.push(promise);`,
+            `                const promise = addExtensionLocale(name, manifest).finally(() =>\n                    Promise.all([addExtensionScript(name, manifest), addExtensionStyle(name, manifest)]),\n                );\n                await promise\n                    .then(() => {\n                        activeExtensions.add(name);\n                        return callExtensionHook(name, 'activate');\n                    })\n                    .catch(err => {\n                        console.log('Could not activate extension', name, err);\n                        extensionLoadErrors.add(t\`Extension \"\${displayName}\" failed to load: \${err}\`);\n                    });\n                promises.push(promise);`,
+            `                const promise = addExtensionLocale(name, manifest).finally(() =>\n                    Promise.all([addExtensionScript(name, manifest), addExtensionStyle(name, manifest)]),\n                )\n                    .then(() => {\n                        activeExtensions.add(name);\n                        return callExtensionHook(name, 'activate');\n                    })\n                    .catch(err => {\n                        console.log('Could not activate extension', name, err);\n                        extensionLoadErrors.add(t\`Extension \"\${displayName}\" failed to load: \${err}\`);\n                    });\n                promises.push(promise);`,
         );
     }
+
+    if (config.patchParallelActivateExtensions && /\bawait\s+promise\s*\r?\n/.test(out)) {
+        out = out.replace(
+            /([ \t]*)await\s+promise\s*\r?\n([\s\S]*?\r?\n\1promises\.push\(promise\);)/,
+            (_match, indent, tail) => {
+                const nextTail = String(tail).replace(/promises\.push\(promise\);/, 'promises.push(cpActivationPromise);');
+                return `${indent}const cpActivationPromise = promise\n${nextTail}`;
+            },
+        );
+    }
+
+    try {
+        console.info('[cocktail-plus:module-diag] patchExtensionsJs', {
+            version: VERSION,
+            changed: before !== out,
+            discoverPrefetchPatchApplied: out.includes('getExtensionDiscover'),
+            manifestPrefetchPatchApplied: out.includes('getExtensionManifest'),
+            parallelActivatePatchApplied: out.includes('cpActivationPromise') || (!out.includes('await promise') && out.includes('return callExtensionHook(name, \'activate\')')),
+            deferActivationApplied: out.includes('cpActivateExtensionsAfterAppReady'),
+        });
+    } catch {}
 
     return out;
 }
@@ -452,11 +541,13 @@ export function makeModuleProxyUrl(publicPath) {
 export async function handleModuleProxy(req, res) {
 
     try {
+        const startedAt = Date.now();
         const { publicPath, fullPath } = normalizePublicPath(req.query?.path || req.path || '');
         let source = await fs.promises.readFile(fullPath, 'utf8');
         source = applyTargetedPatches(source, publicPath);
         source = rewriteModuleSpecifiers(source, publicPath);
         source += `\n//# sourceURL=${publicPath}\n`;
+        console.info('[cocktail-plus:route-diag] serving module proxy', { publicPath, bytes: Buffer.byteLength(source, 'utf8'), durationMs: Date.now() - startedAt });
         const etag = makeEtag(source);
         res.setHeader(HEADER_PREFIX, VERSION);
         res.setHeader(`${HEADER_PREFIX}-module-proxy`, publicPath);

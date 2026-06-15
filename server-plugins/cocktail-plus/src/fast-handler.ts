@@ -142,14 +142,38 @@ export function sendFetchResult(res, result, state, entry = null, extraHeaders =
     res.send(result.bodyText ?? '');
 }
 
+function logFastDecision(endpointKey, decision, detail = {}) {
+    if (endpointKey !== 'characters-all') return;
+    try {
+        console.info('[cocktail-plus:fast-diag]', decision, {
+            endpointKey,
+            at: new Date().toISOString(),
+            ...detail,
+        });
+    } catch {
+        // diagnostics must never affect the request path
+    }
+}
+
 export async function handleFast(req, res, endpointKey) {
+    const startedAt = Date.now();
     stats.requests++;
     const endpoint = ENDPOINTS[endpointKey];
     const ctx = makeRequestContext(req);
     ctx.requestId = nextRequestId(endpointKey);
 
+    logFastDecision(endpointKey, 'request-enter', {
+        requestId: ctx.requestId,
+        method: req.method,
+        cacheEnabled: !!config.enabled && !!config[endpoint.configKey],
+        asyncCharactersAllOnMiss: !!config.asyncCharactersAllOnMiss,
+        allowEmptyCharactersAllOnMiss: !!config.allowEmptyCharactersAllOnMiss,
+        blockCharactersAllOnMiss: !!config.blockCharactersAllOnMiss,
+    });
+
     if (!config.enabled || !config[endpoint.configKey]) {
         const result = await fetchOriginal(ctx, endpoint);
+        logFastDecision(endpointKey, 'bypass-original-return', { requestId: ctx.requestId, status: result.status, durationMs: Date.now() - startedAt });
         return sendFetchResult(res, result, 'BYPASS');
     }
 
@@ -166,6 +190,7 @@ export async function handleFast(req, res, endpointKey) {
             stats.hits++;
             entry.hitCount = Number(entry.hitCount || 0) + 1;
             memoryCache.set(cacheKey, entry);
+            logFastDecision(endpointKey, 'hit-return', { requestId: ctx.requestId, status: entry.status, ageMs, signatureMatches, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(entry.bodyText || '', 'utf8') });
             return sendEntry(res, entry, 'HIT');
         }
         if (config.staleWhileRevalidate && (signatureMatches || endpoint.staleOnSignatureChange)) {
@@ -175,6 +200,7 @@ export async function handleFast(req, res, endpointKey) {
             const state = signatureMatches ? 'STALE' : 'STALE-SIGNATURE';
             const reason = signatureMatches ? 'max-stale-expired' : 'signature-changed';
             void refreshEntry(ctx, endpointKey, reason).catch(() => {});
+            logFastDecision(endpointKey, 'stale-return', { requestId: ctx.requestId, state, reason, ageMs, signatureMatches, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(entry.bodyText || '', 'utf8') });
             return sendEntry(res, entry, state);
         }
     }
@@ -196,6 +222,7 @@ export async function handleFast(req, res, endpointKey) {
         memoryCache.set(cacheKey, fastEntry);
         writeDiskEntry(ctx, endpointKey, fastEntry);
         if (fastMiss.refreshReason) void refreshEntry(ctx, endpointKey, fastMiss.refreshReason).catch(() => {});
+        logFastDecision(endpointKey, 'fast-miss-return', { requestId: ctx.requestId, state: fastMiss.state, refreshReason: fastMiss.refreshReason, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(fastMiss.bodyText || '', 'utf8') });
         return sendEntry(res, fastEntry, fastMiss.state, fastMiss.extraResponseHeaders);
     }
 
@@ -203,19 +230,24 @@ export async function handleFast(req, res, endpointKey) {
     if (asyncMiss) {
         stats.misses++;
         if (asyncMiss.refreshReason) void refreshEntry(ctx, endpointKey, asyncMiss.refreshReason).catch(() => {});
+        logFastDecision(endpointKey, 'async-miss-return', { requestId: ctx.requestId, state: asyncMiss.state, refreshReason: asyncMiss.refreshReason, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(asyncMiss.bodyText || '', 'utf8') });
         return sendFetchResult(res, asyncMiss, asyncMiss.state, null, asyncMiss.extraResponseHeaders);
     }
 
     stats.misses++;
     try {
+        logFastDecision(endpointKey, 'blocking-refresh-start', { requestId: ctx.requestId, hasEntry: !!entry, durationMs: Date.now() - startedAt });
         const { result, entry: refreshedEntry } = await refreshEntry(ctx, endpointKey, entry ? 'blocking-refresh' : 'miss');
         if (refreshedEntry) {
+            logFastDecision(endpointKey, 'blocking-refresh-entry-return', { requestId: ctx.requestId, status: refreshedEntry.status, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(refreshedEntry.bodyText || '', 'utf8') });
             return sendEntry(res, refreshedEntry, entry ? 'REFRESH' : 'MISS');
         }
+        logFastDecision(endpointKey, 'blocking-refresh-result-return', { requestId: ctx.requestId, status: result?.status, durationMs: Date.now() - startedAt, bodyBytes: Buffer.byteLength(result?.bodyText || '', 'utf8') });
         return sendFetchResult(res, result, entry ? 'REFRESH' : 'MISS');
     } catch (error) {
         if (entry) {
             entry.lastError = error instanceof Error ? error.message : String(error);
+            logFastDecision(endpointKey, 'stale-error-return', { requestId: ctx.requestId, error: entry.lastError, durationMs: Date.now() - startedAt });
             return sendEntry(res, entry, 'STALE-ERROR');
         }
         res.status(502).json({ ok: false, error: error instanceof Error ? error.message : String(error), plugin: info });

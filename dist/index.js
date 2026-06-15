@@ -63,6 +63,7 @@ const state = {
     scriptURL: "",
     scope: ""
   },
+  browserLogs: null,
   busy: false,
   localSettings: { ...DEFAULT_LOCAL_SETTINGS }
 };
@@ -168,6 +169,18 @@ async function fullProbe() {
   log("fullProbe.start", { controller: ((_b = (_a = navigator.serviceWorker) == null ? void 0 : _a.controller) == null ? void 0 : _b.scriptURL) || "" });
   await Promise.allSettled([probeBackend(), refreshServiceWorkerState()]);
   log("fullProbe.end", { backendOk: !!((_c = state.backend) == null ? void 0 : _c.ok) });
+}
+async function refreshBrowserLogs(limit = 200) {
+  var _a;
+  if (!((_a = state.backend) == null ? void 0 : _a.ok)) return null;
+  const result = await postJson(`${API_PREFIX}/browser-logs/list`, { limit });
+  state.browserLogs = result;
+  if (state.backend) state.backend.browserLogs = { total: result.total, maxEntries: result.maxEntries, lastReceivedAt: result.lastReceivedAt };
+  return result;
+}
+async function clearBrowserLogs() {
+  await postJson(`${API_PREFIX}/browser-logs/clear`, {});
+  await refreshBrowserLogs();
 }
 let appReady = false;
 let charactersRefreshScheduled = false;
@@ -1020,6 +1033,27 @@ function renderChatSaveStats() {
     </div>
   `;
 }
+function renderBrowserLogsSection() {
+  var _a, _b, _c;
+  const status = (_a = state.backend) == null ? void 0 : _a.browserLogs;
+  const logs = state.browserLogs;
+  const text = (logs == null ? void 0 : logs.text) || "";
+  const entries = (logs == null ? void 0 : logs.entries) || [];
+  const last = (status == null ? void 0 : status.lastReceivedAt) ? fmtTime(status.lastReceivedAt) : "-";
+  return `
+    <div class="cp-section">
+      <b>浏览器日志接管</b>
+      <div class="cp-muted">Early Bridge 会捕获浏览器 <code>console.*</code>、<code>window.onerror</code>、<code>unhandledrejection</code> 并上报到后端环形缓存。错误/警告也会在后端终端打印，方便没有浏览器控制台时复制。</div>
+      <div class="cp-muted">后端缓存：${status ? `${status.total}/${status.maxEntries}` : "-"}；最近接收：${last}；当前显示：${entries.length} 条</div>
+      <div class="cp-actions cp-actions-top">
+        <button id="cp_browser_logs_refresh" class="menu_button" ${((_b = state.backend) == null ? void 0 : _b.ok) ? "" : "disabled"}>刷新日志</button>
+        <button id="cp_browser_logs_copy" class="menu_button" ${text ? "" : "disabled"}>复制日志</button>
+        <button id="cp_browser_logs_clear" class="menu_button" ${((_c = state.backend) == null ? void 0 : _c.ok) ? "" : "disabled"}>清空日志</button>
+      </div>
+      <textarea id="cp_browser_logs_text" class="cp-command cp-browser-logs" rows="10" readonly>${escapeHtml(text || "暂无日志。点击“刷新日志”读取后端缓存。")}</textarea>
+    </div>
+  `;
+}
 function renderPanel() {
   var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l;
   const root = ensurePanelShell();
@@ -1077,6 +1111,8 @@ function renderPanel() {
       <b>chat/save 优化状态</b>
       ${renderChatSaveStats()}
     </div>
+
+    ${renderBrowserLogsSection()}
   `;
   bindPanelEvents(root);
 }
@@ -1098,9 +1134,14 @@ function bindPanelEvents(root) {
     await checkForUpdates({ manual: true, prompt: true });
   });
   onClick("cp_run_update", performUpdate);
+  onClick("cp_browser_logs_refresh", async () => {
+    await refreshBrowserLogs(300);
+  });
+  onClick("cp_browser_logs_clear", clearBrowserLogs);
   bindCopyCommand(root, "cp_copy_windows_helper", "cp_helper_windows_command");
   bindCopyCommand(root, "cp_copy_windows_cmd_helper", "cp_helper_windows_cmd_command");
   bindCopyCommand(root, "cp_copy_unix_helper", "cp_helper_unix_command");
+  bindCopyCommand(root, "cp_browser_logs_copy", "cp_browser_logs_text");
   const onLocalBool = (id, key) => {
     const el = root.querySelector(`#${id}`);
     el == null ? void 0 : el.addEventListener("change", () => {

@@ -935,7 +935,9 @@ function Get-BackendConfigSchema {
         [pscustomobject]@{ Key='diskCacheCharactersAll'; Label='characters/all 磁盘缓存'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='diskCacheVersion'; Label='/version 磁盘缓存'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='fastVersionOnMiss'; Label='/version 无缓存快速响应'; Type='bool'; Default=$true },
-        [pscustomobject]@{ Key='asyncCharactersAllOnMiss'; Label='无 characters 缓存先返回空列表并后台构建'; Type='bool'; Default=$true },
+        [pscustomobject]@{ Key='asyncCharactersAllOnMiss'; Label='characters 无缓存时异步构建并先进入页面'; Type='bool'; Default=$true },
+        [pscustomobject]@{ Key='allowEmptyCharactersAllOnMiss'; Label='允许无缓存先返回空角色列表（配合自动加载保护）'; Type='bool'; Default=$true },
+        [pscustomobject]@{ Key='blockCharactersAllOnMiss'; Label='阻塞等待真实 characters/all（慢速兼容模式）'; Type='bool'; Default=$false },
         [pscustomobject]@{ Key='earlyBridgeEnabled'; Label='启用 Early Bridge 脚本'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='autoInstallEarlyBridge'; Label='后端启动时自动注入 Early Bridge'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='earlyBridgePatchFetch'; Label='Early Bridge patch fetch'; Type='bool'; Default=$true },
@@ -954,7 +956,7 @@ function Get-BackendConfigSchema {
         [pscustomobject]@{ Key='chatSaveCacheMaxEntries'; Label='chat 后端缓存条目'; Type='int'; Default=64; Min=0; Max=1024 },
         [pscustomobject]@{ Key='templatePreloadEnabled'; Label='并行预取 scripts/templates 模板'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='startupPreloadEnabled'; Label='提前预取 /version 响应'; Type='bool'; Default=$true },
-        [pscustomobject]@{ Key='serviceWorkerFastRouteFallback'; Label='SW 兜底 /version 与 characters/all'; Type='bool'; Default=$false },
+        [pscustomobject]@{ Key='serviceWorkerFastRouteFallback'; Label='SW 兜底 /version 与 characters/all'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='serviceWorkerSettingsGetFallback'; Label='SW 兜底 settings/get'; Type='bool'; Default=$false },
         [pscustomobject]@{ Key='serviceWorkerSettingsSaveFallback'; Label='SW 兜底 settings/save'; Type='bool'; Default=$false },
         [pscustomobject]@{ Key='serviceWorkerChatSaveFallback'; Label='SW 兜底 chat/save'; Type='bool'; Default=$false },
@@ -964,7 +966,9 @@ function Get-BackendConfigSchema {
         [pscustomobject]@{ Key='patchI18nInit'; Label='替换 initLocales 串行等待'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='patchSystemMessagesInit'; Label='替换 initSystemMessages 模板串行'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='patchExtensionManifests'; Label='替换 getManifests 使用预取结果'; Type='bool'; Default=$true },
-        [pscustomobject]@{ Key='patchParallelActivateExtensions'; Label='并行激活扩展（实验）'; Type='bool'; Default=$true },
+        [pscustomobject]@{ Key='patchParallelActivateExtensions'; Label='并行激活扩展（等待完成，不延后到 APP_READY）'; Type='bool'; Default=$true },
+        [pscustomobject]@{ Key='deferExtensionActivationUntilAppReady'; Label='APP_READY 后激活前端扩展（最快首屏，带事件回放）'; Type='bool'; Default=$true },
+        [pscustomobject]@{ Key='browserLogCaptureEnabled'; Label='接管浏览器 console/error 日志到后端'; Type='bool'; Default=$true },
         [pscustomobject]@{ Key='autoPatchChatsEnoentGuard'; Label='启动时自动写入 ST chats.js ENOENT 防崩补丁'; Type='bool'; Default=$false }
     )
 }
