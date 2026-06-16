@@ -6,6 +6,6 @@
   "js": "dist/index.js",
   "css": "dist/style.css",
   "author": "Limerence",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "通过可选后端 Server Plugin + Early Bridge / Service Worker 优化启动、角色列表、settings/chat 保存，并保持前端扩展加载生命周期兼容。"
 }

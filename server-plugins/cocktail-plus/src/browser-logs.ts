@@ -54,11 +54,6 @@ function normalizeEntry(raw, req) {
 function pushEntry(entry) {
     entries.push(entry);
     while (entries.length > MAX_ENTRIES) entries.shift();
-    if (['error', 'warn', 'unhandledrejection', 'window-error'].includes(entry.level)) {
-        const text = entry.message || entry.args?.join(' ') || '';
-        const printer = entry.level === 'warn' ? console.warn : console.error;
-        printer(`[cocktail-plus:browser-${entry.level}]`, text, entry.stack ? `\n${entry.stack}` : '');
-    }
 }
 
 export function ingestBrowserLogs(req) {

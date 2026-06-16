@@ -22,7 +22,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.20";
+  return "0.1.21";
 }
 var VERSION = readVersion();
 var info = {
@@ -7553,12 +7553,6 @@ function normalizeEntry(raw, req) {
 function pushEntry(entry) {
   entries.push(entry);
   while (entries.length > MAX_ENTRIES) entries.shift();
-  if (["error", "warn", "unhandledrejection", "window-error"].includes(entry.level)) {
-    const text = entry.message || entry.args?.join(" ") || "";
-    const printer = entry.level === "warn" ? console.warn : console.error;
-    printer(`[cocktail-plus:browser-${entry.level}]`, text, entry.stack ? `
-${entry.stack}` : "");
-  }
 }
 function ingestBrowserLogs(req) {
   const body = req.body || {};
