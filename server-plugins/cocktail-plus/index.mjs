@@ -22,7 +22,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.22";
+  return "0.1.23";
 }
 var VERSION = readVersion();
 var info = {
@@ -272,6 +272,26 @@ function getPathValue(obj, pathValue, fallback = void 0) {
 // server-plugins/cocktail-plus/src/endpoints/characters-all.ts
 var JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 var MAX_CARD_TEXT_CHUNK_BYTES = 64 * 1024 * 1024;
+var PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+var PNG_CHUNK_HEADER_BYTES = 8;
+var DEFAULT_SCAN_CONCURRENCY = 6;
+function resolveScanConcurrency(config2) {
+  const raw = Number(config2?.charactersAllScanConcurrency);
+  if (!Number.isFinite(raw)) return DEFAULT_SCAN_CONCURRENCY;
+  return Math.max(1, Math.min(32, Math.trunc(raw)));
+}
+async function mapWithConcurrency(items, limit, iterator) {
+  const size = Math.max(1, Math.min(limit, items.length));
+  let cursor = 0;
+  const workers = new Array(size).fill(null).map(async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= items.length) break;
+      await iterator(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+}
 function callProgress(onProgress, patch) {
   try {
     if (typeof onProgress === "function") onProgress(patch);
@@ -326,22 +346,22 @@ function normalizeBoolean(value) {
 function normalizeArray(value) {
   return Array.isArray(value) ? value : [];
 }
-function calculateChatSize(chatsRoot, avatarFileName) {
+async function calculateChatSize(chatsRoot, avatarFileName) {
   let chatSize = 0;
   let dateLastChat = 0;
   try {
     const charDir = path3.join(chatsRoot, String(avatarFileName || "").replace(/\.png$/i, ""));
-    if (!fs4.existsSync(charDir)) return { chatSize, dateLastChat };
-    const chats = fs4.readdirSync(charDir);
-    for (const chat of chats) {
+    const entries2 = await fs4.promises.readdir(charDir, { withFileTypes: true }).catch(() => null);
+    if (!entries2) return { chatSize, dateLastChat };
+    await Promise.all(entries2.map(async (entry) => {
+      if (!entry.isFile()) return;
       try {
-        const stat = fs4.statSync(path3.join(charDir, chat));
-        if (!stat.isFile()) continue;
+        const stat = await fs4.promises.stat(path3.join(charDir, entry.name));
         chatSize += stat.size;
         dateLastChat = Math.max(dateLastChat, stat.mtimeMs);
       } catch {
       }
-    }
+    }));
   } catch {
   }
   return { chatSize, dateLastChat };
@@ -353,53 +373,56 @@ function calculateDataSize(data) {
     return 0;
   }
 }
-function extractPngTextChunks(buffer) {
-  const chunks = [];
-  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return chunks;
-  let offset = 8;
-  while (offset + 12 <= buffer.length) {
-    const length = buffer.readUInt32BE(offset);
-    const typeStart = offset + 4;
-    const typeEnd = offset + 8;
-    const dataStart = offset + 8;
-    const dataEnd = dataStart + length;
-    const nextOffset = dataEnd + 4;
-    if (length < 0 || dataEnd > buffer.length || nextOffset > buffer.length) break;
-    const type = buffer.toString("ascii", typeStart, typeEnd);
-    if (type === "tEXt") {
-      const separator = buffer.indexOf(0, dataStart);
-      if (separator >= dataStart && separator < dataEnd) {
-        const keyword = buffer.toString("latin1", dataStart, separator).toLowerCase();
-        if (keyword === "chara" || keyword === "ccv3") {
-          const textLength = dataEnd - separator - 1;
-          if (textLength > MAX_CARD_TEXT_CHUNK_BYTES) {
-            throw new Error(`PNG ${keyword} metadata is too large: ${textLength} bytes`);
-          }
-          const text = buffer.toString("latin1", separator + 1, dataEnd);
-          chunks.push({ keyword, text });
-        }
-      }
-    }
-    if (type === "IEND") break;
-    offset = nextOffset;
-  }
-  return chunks;
-}
 async function readCharacterCardJson(filePath) {
-  const buffer = await fs4.promises.readFile(filePath);
-  const textChunks = extractPngTextChunks(buffer);
-  const selected = textChunks.find((chunk) => chunk.keyword === "ccv3") || textChunks.find((chunk) => chunk.keyword === "chara");
-  if (!selected) throw new Error("No character metadata found");
-  return Buffer.from(selected.text, "base64").toString("utf8");
+  const handle = await fs4.promises.open(filePath, "r");
+  try {
+    const signature = Buffer.alloc(PNG_SIGNATURE.length);
+    const sig = await handle.read(signature, 0, signature.length, 0);
+    if (sig.bytesRead < signature.length || !signature.equals(PNG_SIGNATURE)) {
+      throw new Error("Not a PNG character card");
+    }
+    const header = Buffer.alloc(PNG_CHUNK_HEADER_BYTES);
+    let offset = PNG_SIGNATURE.length;
+    let chara = null;
+    let ccv3 = null;
+    while (true) {
+      const headerRead = await handle.read(header, 0, PNG_CHUNK_HEADER_BYTES, offset);
+      if (headerRead.bytesRead < PNG_CHUNK_HEADER_BYTES) break;
+      const length = header.readUInt32BE(0);
+      const type = header.toString("ascii", 4, 8);
+      const dataStart = offset + PNG_CHUNK_HEADER_BYTES;
+      if (type === "IEND") break;
+      if (type === "tEXt" && length > 0) {
+        if (length > MAX_CARD_TEXT_CHUNK_BYTES) {
+          throw new Error(`PNG tEXt metadata is too large: ${length} bytes`);
+        }
+        const data = Buffer.alloc(length);
+        await handle.read(data, 0, length, dataStart);
+        const separator = data.indexOf(0);
+        if (separator > 0) {
+          const keyword = data.toString("latin1", 0, separator).toLowerCase();
+          if (keyword === "ccv3") ccv3 = data.toString("latin1", separator + 1);
+          else if (keyword === "chara") chara = data.toString("latin1", separator + 1);
+        }
+        if (ccv3) break;
+      }
+      offset = dataStart + length + 4;
+    }
+    const selected = ccv3 || chara;
+    if (!selected) throw new Error("No character metadata found");
+    return Buffer.from(selected, "base64").toString("utf8");
+  } finally {
+    await handle.close();
+  }
 }
-function makeShallowCharacterFromCard(raw, avatarFileName, stat, directories) {
+async function makeShallowCharacterFromCard(raw, avatarFileName, stat, directories) {
   const data = raw && typeof raw.data === "object" && raw.data !== null ? raw.data : {};
   const extensions = data.extensions && typeof data.extensions === "object" ? data.extensions : {};
   const name = String(data.name || raw?.name || path3.basename(avatarFileName, path3.extname(avatarFileName)) || "").trim();
   if (!name) return null;
   const tags = normalizeArray(data.tags).length ? normalizeArray(data.tags) : normalizeArray(raw?.tags);
   const fav = normalizeBoolean(raw?.fav ?? extensions.fav);
-  const { chatSize, dateLastChat } = calculateChatSize(directories.chats, avatarFileName);
+  const { chatSize, dateLastChat } = await calculateChatSize(directories.chats, avatarFileName);
   const createDate = raw?.create_date || data.create_date || new Date(Math.round(stat?.ctimeMs || Date.now())).toISOString();
   return toShallowCharacter({
     name,
@@ -429,7 +452,7 @@ async function processCharacterFileDirect(fileName, directories) {
   const stat = await fs4.promises.stat(filePath);
   const jsonText = await readCharacterCardJson(filePath);
   const raw = JSON.parse(jsonText);
-  return { character: makeShallowCharacterFromCard(raw, fileName, stat, directories), stat };
+  return { character: await makeShallowCharacterFromCard(raw, fileName, stat, directories), stat };
 }
 async function fetchCharactersAllDirect(ctx, config2, options = {}) {
   if (!config2.shallowCharactersAll) return null;
@@ -441,43 +464,43 @@ async function fetchCharactersAllDirect(ctx, config2, options = {}) {
   callProgress(onProgress, progressPatch("scanning", startedAt, 0, null, { status: null, error: null }));
   const dirents = await fs4.promises.readdir(charactersDir, { withFileTypes: true });
   const pngFiles = dirents.filter((entry) => entry.isFile() && path3.extname(entry.name).toLowerCase() === ".png").map((entry) => entry.name).sort((a, b) => a.localeCompare(b));
-  const fileStats = /* @__PURE__ */ new Map();
-  let totalBytes = 0;
-  for (const fileName of pngFiles) {
-    try {
-      const stat = await fs4.promises.stat(path3.join(charactersDir, fileName));
-      fileStats.set(fileName, stat);
-      totalBytes += stat.size;
-    } catch {
-    }
-  }
+  const concurrency = resolveScanConcurrency(config2);
   const characters = [];
+  let processed = 0;
   let processedBytes = 0;
   let errors = 0;
   let lastEmitAt = 0;
-  callProgress(onProgress, progressPatch("reading", startedAt, 0, totalBytes, { count: 0, totalCount: pngFiles.length }));
-  for (let index = 0; index < pngFiles.length; index++) {
-    const fileName = pngFiles[index];
-    const stat = fileStats.get(fileName);
+  callProgress(onProgress, progressPatch("reading", startedAt, 0, null, { count: 0, totalCount: pngFiles.length, errors: 0 }));
+  await mapWithConcurrency(pngFiles, concurrency, async (fileName) => {
     try {
-      const { character } = await processCharacterFileDirect(fileName, directories);
+      const { character, stat } = await processCharacterFileDirect(fileName, directories);
       if (character?.name) characters.push(character);
+      processedBytes += stat?.size || 0;
     } catch (error) {
       errors++;
       console.warn(`[cocktail-plus] Could not build shallow character cache entry for ${fileName}:`, error instanceof Error ? error.message : error);
     } finally {
-      processedBytes += stat?.size || 0;
+      processed++;
       const now = Date.now();
-      if (now - lastEmitAt >= 100 || index === pngFiles.length - 1) {
+      if (now - lastEmitAt >= 100 || processed === pngFiles.length) {
         lastEmitAt = now;
-        callProgress(onProgress, progressPatch("reading", startedAt, processedBytes, totalBytes, { count: index + 1, totalCount: pngFiles.length, errors }));
+        callProgress(onProgress, progressPatch("reading", startedAt, processedBytes, null, { count: processed, totalCount: pngFiles.length, errors }));
       }
     }
-  }
-  callProgress(onProgress, progressPatch("transforming", startedAt, processedBytes, totalBytes, { count: characters.length, totalCount: pngFiles.length, errors, etaMs: 0 }));
+  });
+  characters.sort((a, b) => String(a?.avatar || "").localeCompare(String(b?.avatar || "")));
+  callProgress(onProgress, progressPatch("transforming", startedAt, processedBytes, processedBytes, { count: characters.length, totalCount: pngFiles.length, errors, etaMs: 0 }));
   const bodyText = JSON.stringify(characters);
   const cachedBytes = Buffer.byteLength(bodyText, "utf8");
   const durationMs = Date.now() - startedAt;
+  console.info("[cocktail-plus] characters-all direct cache built", {
+    total: pngFiles.length,
+    count: characters.length,
+    errors,
+    durationMs,
+    cachedBytes,
+    concurrency
+  });
   return {
     ok: true,
     status: 200,
@@ -486,7 +509,7 @@ async function fetchCharactersAllDirect(ctx, config2, options = {}) {
     bodyText,
     durationMs,
     bytesReceived: processedBytes,
-    totalBytes,
+    totalBytes: processedBytes,
     transform: {
       transformed: true,
       direct: true,
@@ -5947,7 +5970,7 @@ var characterEditEndpoint = {
   configKey: "cacheCharactersAll",
   method: "POST"
 };
-function extractPngTextChunks2(buffer) {
+function extractPngTextChunks(buffer) {
   const chunks = [];
   if (!Buffer.isBuffer(buffer) || buffer.length < 12) return chunks;
   let offset = 8;
@@ -5973,7 +5996,7 @@ function extractPngTextChunks2(buffer) {
 async function readCharacterRawJson(directories, avatar) {
   const filePath = path12.join(directories.characters, path12.basename(avatar));
   const buffer = await fs13.promises.readFile(filePath);
-  const chunks = extractPngTextChunks2(buffer);
+  const chunks = extractPngTextChunks(buffer);
   const selected = chunks.find((c) => c.keyword === "ccv3") || chunks.find((c) => c.keyword === "chara");
   if (!selected) throw new Error("No character metadata found");
   return Buffer.from(selected.text, "base64").toString("utf8");
@@ -6553,7 +6576,7 @@ async function getChatInfoFast(chatFile) {
     });
   });
 }
-function extractPngTextChunks3(buffer) {
+function extractPngTextChunks2(buffer) {
   const chunks = [];
   if (!Buffer.isBuffer(buffer) || buffer.length < 12) return chunks;
   let offset = 8;
@@ -6583,7 +6606,7 @@ async function readCharacterName(ctx, avatarFile) {
   try {
     const filePath = path14.join(ctx.directories.characters, avatarFile);
     const buffer = await fs15.promises.readFile(filePath);
-    const chunks = extractPngTextChunks3(buffer);
+    const chunks = extractPngTextChunks2(buffer);
     const selected = chunks.find((c) => c.keyword === "ccv3") || chunks.find((c) => c.keyword === "chara");
     if (!selected) return path14.basename(avatarFile, path14.extname(avatarFile));
     const raw = JSON.parse(Buffer.from(selected.text, "base64").toString("utf8"));
