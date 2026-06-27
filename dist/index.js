@@ -170,17 +170,17 @@ async function fullProbe() {
   await Promise.allSettled([probeBackend(), refreshServiceWorkerState()]);
   log("fullProbe.end", { backendOk: !!((_c = state.backend) == null ? void 0 : _c.ok) });
 }
-async function refreshBrowserLogs(limit = 200) {
+async function refreshBrowserLogs(limit = 1e4) {
   var _a;
   if (!((_a = state.backend) == null ? void 0 : _a.ok)) return null;
   const result = await postJson(`${API_PREFIX}/browser-logs/list`, { limit });
   state.browserLogs = result;
-  if (state.backend) state.backend.browserLogs = { total: result.total, maxEntries: result.maxEntries, lastReceivedAt: result.lastReceivedAt };
+  if (state.backend) state.backend.browserLogs = { total: result.total, maxEntries: result.maxEntries, maxFieldChars: result.maxFieldChars, lastReceivedAt: result.lastReceivedAt };
   return result;
 }
 async function clearBrowserLogs() {
   await postJson(`${API_PREFIX}/browser-logs/clear`, {});
-  await refreshBrowserLogs();
+  await refreshBrowserLogs(1e4);
 }
 let appReady = false;
 let charactersRefreshScheduled = false;
@@ -1050,9 +1050,9 @@ function renderBrowserLogsSection() {
   const last = (status == null ? void 0 : status.lastReceivedAt) ? fmtTime(status.lastReceivedAt) : "-";
   return `
     <div class="cp-section">
-      <b>浏览器日志接管</b>
-      <div class="cp-muted">Early Bridge 会捕获浏览器 <code>console.*</code>、<code>window.onerror</code>、<code>unhandledrejection</code> 并上报到后端环形缓存。错误/警告也会在后端终端打印，方便没有浏览器控制台时复制。</div>
-      <div class="cp-muted">后端缓存：${status ? `${status.total}/${status.maxEntries}` : "-"}；最近接收：${last}；当前显示：${entries.length} 条</div>
+      <b>前后端日志接管</b>
+      <div class="cp-muted">Early Bridge 会捕获浏览器 <code>console.*</code>、<code>window.onerror</code>、<code>unhandledrejection</code>；后端插件也会捕获 Node/SillyTavern 终端 <code>console.*</code>。日志前缀用 <code>[frontend:页面ID]</code> / <code>[backend:PID]</code> 区分，同一用户多标签页或重载后的页面也会有不同页面ID。</div>
+      <div class="cp-muted">后端缓存：${status ? `${status.total}/${status.maxEntries}` : "-"}；单字段上限：${fmtBytes(status == null ? void 0 : status.maxFieldChars)}；最近接收：${last}；当前显示：${entries.length} 条；文本内容与 <code>/api/plugins/cocktail-plus/browser-logs/text?limit=10000</code> 使用同一格式。</div>
       <div class="cp-actions cp-actions-top">
         <button id="cp_browser_logs_refresh" class="menu_button" ${((_b = state.backend) == null ? void 0 : _b.ok) ? "" : "disabled"}>刷新日志</button>
         <button id="cp_browser_logs_copy" class="menu_button" ${text ? "" : "disabled"}>复制日志</button>
@@ -1143,7 +1143,7 @@ function bindPanelEvents(root) {
   });
   onClick("cp_run_update", performUpdate);
   onClick("cp_browser_logs_refresh", async () => {
-    await refreshBrowserLogs(300);
+    await refreshBrowserLogs(1e4);
   });
   onClick("cp_browser_logs_clear", clearBrowserLogs);
   bindCopyCommand(root, "cp_copy_windows_helper", "cp_helper_windows_command");

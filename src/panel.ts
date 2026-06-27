@@ -302,9 +302,9 @@ function renderBrowserLogsSection() {
   const last = status?.lastReceivedAt ? fmtTime(status.lastReceivedAt) : '-';
   return `
     <div class="cp-section">
-      <b>浏览器日志接管</b>
-      <div class="cp-muted">Early Bridge 会捕获浏览器 <code>console.*</code>、<code>window.onerror</code>、<code>unhandledrejection</code> 并上报到后端环形缓存。错误/警告也会在后端终端打印，方便没有浏览器控制台时复制。</div>
-      <div class="cp-muted">后端缓存：${status ? `${status.total}/${status.maxEntries}` : '-'}；最近接收：${last}；当前显示：${entries.length} 条</div>
+      <b>前后端日志接管</b>
+      <div class="cp-muted">Early Bridge 会捕获浏览器 <code>console.*</code>、<code>window.onerror</code>、<code>unhandledrejection</code>；后端插件也会捕获 Node/SillyTavern 终端 <code>console.*</code>。日志前缀用 <code>[frontend:页面ID]</code> / <code>[backend:PID]</code> 区分，同一用户多标签页或重载后的页面也会有不同页面ID。</div>
+      <div class="cp-muted">后端缓存：${status ? `${status.total}/${status.maxEntries}` : '-'}；单字段上限：${fmtBytes(status?.maxFieldChars)}；最近接收：${last}；当前显示：${entries.length} 条；文本内容与 <code>/api/plugins/cocktail-plus/browser-logs/text?limit=10000</code> 使用同一格式。</div>
       <div class="cp-actions cp-actions-top">
         <button id="cp_browser_logs_refresh" class="menu_button" ${state.backend?.ok ? '' : 'disabled'}>刷新日志</button>
         <button id="cp_browser_logs_copy" class="menu_button" ${text ? '' : 'disabled'}>复制日志</button>
@@ -396,7 +396,7 @@ function bindPanelEvents(root: HTMLElement) {
   onClick('cp_early_uninstall', uninstallEarlyBridge);
   onClick('cp_check_update', async () => { await checkForUpdates({ manual: true, prompt: true }); });
   onClick('cp_run_update', performUpdate);
-  onClick('cp_browser_logs_refresh', async () => { await refreshBrowserLogs(300); });
+  onClick('cp_browser_logs_refresh', async () => { await refreshBrowserLogs(10_000); });
   onClick('cp_browser_logs_clear', clearBrowserLogs);
   bindCopyCommand(root, 'cp_copy_windows_helper', 'cp_helper_windows_command');
   bindCopyCommand(root, 'cp_copy_windows_cmd_helper', 'cp_helper_windows_cmd_command');

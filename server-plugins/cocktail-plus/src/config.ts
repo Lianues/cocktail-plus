@@ -72,6 +72,9 @@ export const DEFAULT_CONFIG = Object.freeze({
     // Optional ST source hotfix. When enabled, plugin patches src/endpoints/chats.js on startup;
     // a restart is still required for the patched source to be loaded by SillyTavern.
     autoPatchChatsEnoentGuard: false,
+    // Internal self-fetches target loopback (127.0.0.1/localhost). When ST uses a self-signed HTTPS
+    // certificate, skip TLS verification only for these loopback requests so fast paths keep working.
+    internalFetchSkipTlsVerify: true,
 });
 
 function asBool(value, fallback = false) {
@@ -142,6 +145,7 @@ export function normalizeConfig(input = {}) {
     out.deferExtensionActivationUntilAppReady = asBool(input.deferExtensionActivationUntilAppReady, DEFAULT_CONFIG.deferExtensionActivationUntilAppReady);
     out.browserLogCaptureEnabled = asBool(input.browserLogCaptureEnabled, DEFAULT_CONFIG.browserLogCaptureEnabled);
     out.autoPatchChatsEnoentGuard = asBool(input.autoPatchChatsEnoentGuard, DEFAULT_CONFIG.autoPatchChatsEnoentGuard);
+    out.internalFetchSkipTlsVerify = asBool(input.internalFetchSkipTlsVerify, DEFAULT_CONFIG.internalFetchSkipTlsVerify);
     return out;
 }
 

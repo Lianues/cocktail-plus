@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { installBackendLogCapture, uninstallBackendLogCapture } from './browser-logs.js';
 import { clearCacheStores } from './cache-store.js';
 import { config } from './config.js';
 import { info } from './constants.js';
@@ -9,6 +10,7 @@ import { autoApplySourcePatches } from './source-patches.js';
 export { info };
 
 export async function init(router) {
+    installBackendLogCapture();
     if (config.autoPatchChatsEnoentGuard) {
         const patchResults = autoApplySourcePatches();
         for (const result of patchResults) {
@@ -29,5 +31,6 @@ export async function init(router) {
 }
 
 export async function exit() {
+    uninstallBackendLogCapture();
     clearCacheStores();
 }

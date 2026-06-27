@@ -1,6 +1,5 @@
-// server-plugins/cocktail-plus/src/cache-store.ts
-import fs10 from "node:fs";
-import path9 from "node:path";
+// server-plugins/cocktail-plus/src/config.ts
+import fs2 from "node:fs";
 
 // server-plugins/cocktail-plus/src/constants.ts
 import fs from "node:fs";
@@ -22,7 +21,7 @@ function readVersion() {
     if (version) return version;
   } catch {
   }
-  return "0.1.23";
+  return "0.1.24";
 }
 var VERSION = readVersion();
 var info = {
@@ -33,7 +32,6 @@ var info = {
 };
 
 // server-plugins/cocktail-plus/src/config.ts
-import fs2 from "node:fs";
 var DEFAULT_CONFIG = Object.freeze({
   enabled: true,
   serviceWorkerEnabled: true,
@@ -102,7 +100,10 @@ var DEFAULT_CONFIG = Object.freeze({
   browserLogCaptureEnabled: true,
   // Optional ST source hotfix. When enabled, plugin patches src/endpoints/chats.js on startup;
   // a restart is still required for the patched source to be loaded by SillyTavern.
-  autoPatchChatsEnoentGuard: false
+  autoPatchChatsEnoentGuard: false,
+  // Internal self-fetches target loopback (127.0.0.1/localhost). When ST uses a self-signed HTTPS
+  // certificate, skip TLS verification only for these loopback requests so fast paths keep working.
+  internalFetchSkipTlsVerify: true
 });
 function asBool(value, fallback = false) {
   if (typeof value === "boolean") return value;
@@ -168,6 +169,7 @@ function normalizeConfig(input = {}) {
   out.deferExtensionActivationUntilAppReady = asBool(input.deferExtensionActivationUntilAppReady, DEFAULT_CONFIG.deferExtensionActivationUntilAppReady);
   out.browserLogCaptureEnabled = asBool(input.browserLogCaptureEnabled, DEFAULT_CONFIG.browserLogCaptureEnabled);
   out.autoPatchChatsEnoentGuard = asBool(input.autoPatchChatsEnoentGuard, DEFAULT_CONFIG.autoPatchChatsEnoentGuard);
+  out.internalFetchSkipTlsVerify = asBool(input.internalFetchSkipTlsVerify, DEFAULT_CONFIG.internalFetchSkipTlsVerify);
   return out;
 }
 function loadConfig() {
@@ -183,6 +185,218 @@ function asBoolean(value, fallback = false) {
   return asBool(value, fallback);
 }
 var config = loadConfig();
+
+// server-plugins/cocktail-plus/src/browser-logs.ts
+var MAX_ENTRIES = 1e4;
+var MAX_INGEST_BATCH = 500;
+var MAX_FIELD_CHARS = 5e6;
+var BACKEND_CAPTURE_KEY = Symbol.for("cocktail-plus.backend-log-capture");
+var CONSOLE_LEVELS = ["debug", "log", "info", "warn", "error", "trace"];
+var nextId = 1;
+var entries = [];
+function clip(value, max = MAX_FIELD_CHARS) {
+  const text = String(value ?? "");
+  return text.length > max ? `${text.slice(0, max)}\u2026<truncated ${text.length - max}>` : text;
+}
+function normalizeArg(value) {
+  if (value === void 0) return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string") return clip(value);
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
+  if (typeof value === "symbol") return clip(value.toString());
+  if (typeof value === "function") return clip(`[Function ${value.name || "anonymous"}]`);
+  if (value instanceof Error) return clip(`${value.name}: ${value.message}
+${value.stack || ""}`);
+  try {
+    const json = JSON.stringify(value);
+    if (json !== void 0) return clip(json);
+  } catch {
+  }
+  try {
+    return clip(Object.prototype.toString.call(value));
+  } catch {
+    return "[unserializable]";
+  }
+}
+function normalizeLevel(level) {
+  const normalized = String(level || "").toLowerCase();
+  return ["debug", "log", "info", "warn", "error", "trace", "unhandledrejection", "window-error"].includes(normalized) ? normalized : "log";
+}
+function normalizeOrigin(origin) {
+  const normalized = String(origin || "").toLowerCase();
+  return normalized === "backend" ? "backend" : "frontend";
+}
+function normalizeEntry(raw, req) {
+  const args = Array.isArray(raw?.args) ? raw.args.map(normalizeArg) : [];
+  const message = raw?.message !== void 0 ? clip(raw.message) : clip(args.join(" "));
+  const level = normalizeLevel(raw?.level);
+  const origin = normalizeOrigin(raw?.origin);
+  const backendPid = Number.isFinite(Number(raw?.backendPid)) ? Number(raw.backendPid) : origin === "backend" ? process.pid : null;
+  return {
+    id: nextId++,
+    receivedAt: Date.now(),
+    serverVersion: VERSION,
+    origin,
+    clientId: clip(raw?.clientId || raw?.pageSessionId || raw?.tabId || "", 500),
+    user: req?.user?.profile?.handle || "",
+    ip: req?.ip || req?.socket?.remoteAddress || "",
+    level,
+    message,
+    args,
+    stack: clip(raw?.stack || ""),
+    pageUrl: clip(raw?.pageUrl || raw?.url || ""),
+    source: clip(raw?.source || (origin === "backend" ? "backend-console" : "browser-console")),
+    line: Number.isFinite(Number(raw?.line)) ? Number(raw.line) : null,
+    column: Number.isFinite(Number(raw?.column)) ? Number(raw.column) : null,
+    userAgent: clip(raw?.userAgent || req?.headers?.["user-agent"] || "", 2e3),
+    backendPid,
+    backendCwd: origin === "backend" ? clip(raw?.backendCwd || process.cwd(), 2e3) : "",
+    timestamp: Number.isFinite(Number(raw?.timestamp)) ? Number(raw.timestamp) : Date.now()
+  };
+}
+function pushEntry(entry) {
+  entries.push(entry);
+  while (entries.length > MAX_ENTRIES) entries.shift();
+}
+function pushRawEntry(raw, req = null) {
+  const entry = normalizeEntry(raw, req);
+  pushEntry(entry);
+  return entry;
+}
+function getTraceStack() {
+  try {
+    const stack = new Error().stack || "";
+    return stack.split("\n").slice(3).join("\n");
+  } catch {
+    return "";
+  }
+}
+function pushBackendLog(level, argsLike, extra = {}) {
+  const args = Array.from(argsLike || []);
+  const normalizedArgs = args.map(normalizeArg);
+  pushRawEntry({
+    origin: "backend",
+    level,
+    args,
+    message: normalizedArgs.join(" "),
+    stack: level === "trace" ? getTraceStack() : "",
+    source: "backend-console",
+    backendPid: process.pid,
+    backendCwd: process.cwd(),
+    timestamp: Date.now(),
+    ...extra
+  });
+}
+function installBackendLogCapture() {
+  if (!config.browserLogCaptureEnabled) return { ok: true, skipped: true, reason: "disabled" };
+  const state = globalThis[BACKEND_CAPTURE_KEY] || (globalThis[BACKEND_CAPTURE_KEY] = { installed: false, originals: {}, wrappers: {} });
+  if (state.installed) return { ok: true, installed: true, already: true };
+  for (const level of CONSOLE_LEVELS) {
+    const original = typeof console[level] === "function" ? console[level].bind(console) : console.log.bind(console);
+    state.originals[level] = original;
+    const wrapper = function cocktailPlusBackendConsoleCapture(...args) {
+      try {
+        original(...args);
+      } catch {
+      }
+      try {
+        pushBackendLog(level, args);
+      } catch {
+      }
+    };
+    state.wrappers[level] = wrapper;
+    try {
+      console[level] = wrapper;
+    } catch {
+    }
+  }
+  state.installed = true;
+  pushRawEntry({
+    origin: "backend",
+    level: "info",
+    source: "backend-log-capture",
+    message: "[cocktail-plus] backend log capture installed",
+    args: ["[cocktail-plus] backend log capture installed"],
+    backendPid: process.pid,
+    backendCwd: process.cwd(),
+    timestamp: Date.now()
+  });
+  return { ok: true, installed: true, maxEntries: MAX_ENTRIES, maxFieldChars: MAX_FIELD_CHARS };
+}
+function uninstallBackendLogCapture() {
+  const state = globalThis[BACKEND_CAPTURE_KEY];
+  if (!state?.installed) return { ok: true, installed: false };
+  for (const level of CONSOLE_LEVELS) {
+    try {
+      if (console[level] === state.wrappers[level]) console[level] = state.originals[level];
+    } catch {
+    }
+  }
+  state.installed = false;
+  return { ok: true, installed: false };
+}
+function ingestBrowserLogs(req) {
+  const body = req.body || {};
+  const rawEntries = Array.isArray(body.entries) ? body.entries : Array.isArray(body) ? body : [body];
+  const batch = rawEntries.slice(0, MAX_INGEST_BATCH).map((raw) => pushRawEntry({ ...raw, origin: raw?.origin || "frontend" }, req));
+  return { ok: true, accepted: batch.length, total: entries.length, maxEntries: MAX_ENTRIES };
+}
+function ingestBrowserLogBeacon(req) {
+  let raw = null;
+  try {
+    if (req.query?.d) raw = JSON.parse(String(req.query.d));
+  } catch {
+    raw = null;
+  }
+  if (!raw) {
+    raw = {
+      level: req.query?.level || "log",
+      message: req.query?.message || "",
+      pageUrl: req.query?.pageUrl || "",
+      clientId: req.query?.clientId || "",
+      source: "beacon-query",
+      timestamp: Date.now()
+    };
+  }
+  const entry = pushRawEntry({ ...raw, origin: raw.origin || "frontend", source: raw.source || "early-beacon" }, req);
+  return { ok: true, accepted: 1, total: entries.length, maxEntries: MAX_ENTRIES, entryId: entry.id };
+}
+function clearBrowserLogs() {
+  const removed = entries.length;
+  entries.splice(0, entries.length);
+  return { ok: true, removed };
+}
+function getBrowserLogs(limit = MAX_ENTRIES) {
+  const safeLimit = Math.max(1, Math.min(MAX_ENTRIES, Number(limit) || MAX_ENTRIES));
+  const list = entries.slice(-safeLimit);
+  return {
+    ok: true,
+    version: VERSION,
+    total: entries.length,
+    maxEntries: MAX_ENTRIES,
+    maxFieldChars: MAX_FIELD_CHARS,
+    lastReceivedAt: entries.length ? entries[entries.length - 1].receivedAt : null,
+    entries: list,
+    text: formatBrowserLogs(list)
+  };
+}
+function formatBrowserLogs(list = entries) {
+  return list.map((entry) => {
+    const time = new Date(entry.receivedAt).toISOString();
+    const origin = entry.origin === "backend" ? `backend:${entry.backendPid || "node"}` : `frontend${entry.clientId ? `:${String(entry.clientId).slice(0, 10)}` : ""}`;
+    const loc = entry.source ? ` ${entry.source}${entry.line !== null ? `:${entry.line}` : ""}${entry.column !== null ? `:${entry.column}` : ""}` : "";
+    const stack = entry.stack ? `
+${entry.stack}` : "";
+    return `[${time}] [${origin}] [${entry.level}]${loc} ${entry.message}${stack}`;
+  }).join("\n");
+}
+function getBrowserLogStatus() {
+  return { total: entries.length, maxEntries: MAX_ENTRIES, maxFieldChars: MAX_FIELD_CHARS, lastReceivedAt: entries.length ? entries[entries.length - 1].receivedAt : null };
+}
+
+// server-plugins/cocktail-plus/src/cache-store.ts
+import fs10 from "node:fs";
+import path9 from "node:path";
 
 // server-plugins/cocktail-plus/src/endpoints/characters-all.ts
 import fs4 from "node:fs";
@@ -575,6 +789,8 @@ import fs6 from "node:fs";
 import path5 from "node:path";
 
 // server-plugins/cocktail-plus/src/original-fetch.ts
+import http from "node:http";
+import https from "node:https";
 function pickResponseHeaders(response) {
   const headers = {};
   const contentType = response.headers.get("content-type");
@@ -587,10 +803,18 @@ function callProgress2(onProgress, patch) {
   } catch {
   }
 }
-function parseContentLength(response) {
-  const raw = response.headers.get("content-length");
-  const value = Number(raw);
+function parseContentLengthValue(raw) {
+  const value = Number(Array.isArray(raw) ? raw[0] : raw);
   return Number.isFinite(value) && value > 0 ? value : null;
+}
+function parseContentLength(response) {
+  return parseContentLengthValue(response.headers.get("content-length"));
+}
+function pickNodeResponseHeaders(response) {
+  const headers = {};
+  const contentType = Array.isArray(response.headers?.["content-type"]) ? response.headers["content-type"][0] : response.headers?.["content-type"];
+  headers["content-type"] = contentType || "application/json; charset=utf-8";
+  return headers;
 }
 function progressPatch2(phase, startedAt, bytesReceived, totalBytes, extra = {}) {
   const elapsedMs = Math.max(1, Date.now() - startedAt);
@@ -637,9 +861,68 @@ async function readBodyWithProgress(response, onProgress, startedAt) {
   callProgress2(onProgress, progressPatch2("downloading", startedAt, bytesReceived, totalBytes || bytesReceived, { status: response.status, etaMs: 0, percent: 100 }));
   return { bodyText, bytesReceived, totalBytes: totalBytes || bytesReceived };
 }
+function isLoopbackHostname(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  return host === "localhost" || host === "::1" || host === "0:0:0:0:0:0:0:1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+function shouldSkipTlsVerifyForInternalFetch(url) {
+  return !!config.internalFetchSkipTlsVerify && url?.protocol === "https:" && isLoopbackHostname(url.hostname);
+}
+function nodeRequestWithProgress(url, method, headers, bodyText, onProgress, startedAt, { skipTlsVerify = false } = {}) {
+  return new Promise((resolve, reject) => {
+    const client = url.protocol === "https:" ? https : http;
+    const requestOptions = {
+      method,
+      headers
+    };
+    if (url.protocol === "https:" && skipTlsVerify) {
+      requestOptions.rejectUnauthorized = false;
+    }
+    callProgress2(onProgress, { phase: "requesting", startedAt, bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, status: null, error: null });
+    const request = client.request(url, requestOptions, (response) => {
+      const status = Number(response.statusCode) || 0;
+      const totalBytes = parseContentLengthValue(response.headers?.["content-length"]);
+      const chunks = [];
+      let bytesReceived = 0;
+      let lastEmitAt = 0;
+      callProgress2(onProgress, progressPatch2("downloading", startedAt, 0, totalBytes, { status }));
+      response.on("data", (chunk) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        chunks.push(buffer);
+        bytesReceived += buffer.byteLength;
+        const now = Date.now();
+        if (now - lastEmitAt >= 100) {
+          lastEmitAt = now;
+          callProgress2(onProgress, progressPatch2("downloading", startedAt, bytesReceived, totalBytes, { status }));
+        }
+      });
+      response.on("end", () => {
+        callProgress2(onProgress, progressPatch2("downloading", startedAt, bytesReceived, totalBytes || bytesReceived, { status, etaMs: 0, percent: totalBytes ? 100 : null }));
+        const durationMs = Date.now() - startedAt;
+        resolve({
+          ok: status >= 200 && status < 300,
+          status,
+          statusText: response.statusMessage || "",
+          headers: pickNodeResponseHeaders(response),
+          bodyText: Buffer.concat(chunks).toString("utf8"),
+          durationMs,
+          bytesReceived,
+          totalBytes: totalBytes || bytesReceived
+        });
+      });
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+    request.setTimeout(5 * 60 * 1e3, () => request.destroy(new Error("Internal fetch timed out")));
+    if (method !== "GET" && method !== "HEAD" && bodyText !== void 0) {
+      request.write(bodyText);
+    }
+    request.end();
+  });
+}
 async function fetchOriginal(ctx, endpoint, options = {}) {
   const method = endpoint.method || "POST";
-  const url = `${ctx.protocol}://${ctx.host}${endpoint.originalPath}`;
+  const url = new URL(`${ctx.protocol}://${ctx.host}${endpoint.originalPath}`);
   const headers = {};
   for (const [key, value] of Object.entries(ctx.headers || {})) {
     if (typeof value === "string" && value.length > 0) headers[key] = value;
@@ -653,12 +936,15 @@ async function fetchOriginal(ctx, endpoint, options = {}) {
   const timer = setTimeout(() => controller.abort(), 5 * 60 * 1e3);
   const onProgress = options?.onProgress;
   try {
+    if (shouldSkipTlsVerifyForInternalFetch(url)) {
+      return await nodeRequestWithProgress(url, method, headers, ctx.bodyText, onProgress, startedAt, { skipTlsVerify: true });
+    }
     const fetchOptions = { method, headers, redirect: "manual", signal: controller.signal };
     if (method !== "GET" && method !== "HEAD") {
       fetchOptions.body = ctx.bodyText;
     }
     callProgress2(onProgress, { phase: "requesting", startedAt, bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, status: null, error: null });
-    const response = await fetch(url, fetchOptions);
+    const response = await fetch(url.href, fetchOptions);
     callProgress2(onProgress, { phase: "downloading", status: response.status, totalBytes: parseContentLength(response), bytesReceived: 0, speedBps: 0, percent: null, etaMs: null });
     const { bodyText, bytesReceived, totalBytes } = await readBodyWithProgress(response, onProgress, startedAt);
     const durationMs = Date.now() - startedAt;
@@ -2377,6 +2663,8 @@ ${fastRoutes}
   };
   var FLAG = '__cocktailPlusEarlyBridge';
   var state = window[FLAG] = window[FLAG] || { version: VERSION, installedAt: Date.now(), events: [], patchedFetch: false, swRegisterStarted: false, settingsSave: { baselineHash: '', captures: 0, optimized: 0, fallbacks: 0, savedBytes: 0 }, chatSave: { baselineCount: 0, captures: 0, optimized: 0, fallbacks: 0, savedBytes: 0, evictions: 0 } };
+  var PAGE_SESSION_ID = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+  state.pageSessionId = PAGE_SESSION_ID;
   state.settingsSave = state.settingsSave || { baselineHash: '', captures: 0, optimized: 0, fallbacks: 0, savedBytes: 0 };
   state.chatSave = state.chatSave || { baselineCount: 0, captures: 0, optimized: 0, fallbacks: 0, savedBytes: 0, evictions: 0 };
   state.charactersLoad = state.charactersLoad || { active: false, phase: 'idle', cache: '', startedAt: 0, updatedAt: 0, bytesReceived: 0, totalBytes: null, speedBps: 0, percent: null, etaMs: null, message: '' };
@@ -2933,7 +3221,9 @@ ${fastRoutes}
 
   function cpClipLogText(value, max) {
     var text = String(value === undefined ? 'undefined' : value === null ? 'null' : value);
-    var limit = max || 3000;
+    // Keep console-captured logs complete enough for real debugging. The backend has a matching high cap;
+    // callers that must fit into beacon/query URLs still pass a smaller explicit max.
+    var limit = max || 5000000;
     return text.length > limit ? text.slice(0, limit) + '\u2026<truncated ' + (text.length - limit) + '>' : text;
   }
 
@@ -2954,6 +3244,8 @@ ${fastRoutes}
     try {
       if (!BROWSER_LOGS.enabled || !BROWSER_LOGS.beaconPath) return;
       var payload = {
+        origin: 'frontend',
+        clientId: PAGE_SESSION_ID,
         level: cpClipLogText(entry && entry.level || 'log', 40),
         message: cpClipLogText(entry && entry.message || (entry && entry.args ? entry.args.join(' ') : ''), 900),
         args: Array.isArray(entry && entry.args) ? entry.args.slice(0, 4).map(function (x) { return cpClipLogText(x, 700); }) : [],
@@ -2973,7 +3265,7 @@ ${fastRoutes}
       }
       var url = BROWSER_LOGS.beaconPath + '?t=' + Date.now() + '&d=' + encodeURIComponent(json);
       if (url.length > 3900) {
-        url = BROWSER_LOGS.beaconPath + '?t=' + Date.now() + '&level=' + encodeURIComponent(payload.level) + '&message=' + encodeURIComponent(cpClipLogText(payload.message, 1200));
+        url = BROWSER_LOGS.beaconPath + '?t=' + Date.now() + '&clientId=' + encodeURIComponent(PAGE_SESSION_ID) + '&level=' + encodeURIComponent(payload.level) + '&message=' + encodeURIComponent(cpClipLogText(payload.message, 1200));
       }
       var img = new Image();
       img.referrerPolicy = 'no-referrer-when-downgrade';
@@ -3002,6 +3294,8 @@ ${fastRoutes}
         if (message.indexOf('[cocktail-plus:route-diag]') === 0 || message.indexOf('[cocktail-plus:module-diag]') === 0 || message.indexOf('[cocktail-plus:fast-diag]') === 0) return;
         var entry = Object.assign({
           seq: state.browserLogSeq++,
+          origin: 'frontend',
+          clientId: PAGE_SESSION_ID,
           level: level,
           args: args,
           message: cpClipLogText(message),
@@ -3439,6 +3733,15 @@ ${fastRoutes}
     try { return new TextEncoder().encode(String(text || '')).byteLength; } catch (_) { return String(text || '').length; }
   }
 
+  function textToUtf8Bytes(text) {
+    text = String(text);
+    if (typeof TextEncoder === 'function') return new TextEncoder().encode(text);
+    var encoded = unescape(encodeURIComponent(text));
+    var bytes = new Uint8Array(encoded.length);
+    for (var i = 0; i < encoded.length; i++) bytes[i] = encoded.charCodeAt(i) & 255;
+    return bytes;
+  }
+
   function bytesToHex(buffer) {
     var bytes = new Uint8Array(buffer);
     var out = '';
@@ -3446,10 +3749,73 @@ ${fastRoutes}
     return out;
   }
 
+  function rotr32(value, bits) {
+    return ((value >>> bits) | (value << (32 - bits))) >>> 0;
+  }
+
+  function wordToHex(value) {
+    return (value >>> 0).toString(16).padStart(8, '0');
+  }
+
+  function sha256HexPureJs(text) {
+    var K = [
+      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ];
+    var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var bytes = textToUtf8Bytes(text);
+    var bitLen = bytes.length * 8;
+    var lenHi = Math.floor(bitLen / 0x100000000);
+    var lenLo = bitLen >>> 0;
+    var totalLen = Math.ceil((bytes.length + 9) / 64) * 64;
+    var data = new Uint8Array(totalLen);
+    data.set(bytes);
+    data[bytes.length] = 0x80;
+    data[totalLen - 8] = (lenHi >>> 24) & 255;
+    data[totalLen - 7] = (lenHi >>> 16) & 255;
+    data[totalLen - 6] = (lenHi >>> 8) & 255;
+    data[totalLen - 5] = lenHi & 255;
+    data[totalLen - 4] = (lenLo >>> 24) & 255;
+    data[totalLen - 3] = (lenLo >>> 16) & 255;
+    data[totalLen - 2] = (lenLo >>> 8) & 255;
+    data[totalLen - 1] = lenLo & 255;
+    var W = new Array(64);
+    for (var offset = 0; offset < data.length; offset += 64) {
+      for (var i = 0; i < 16; i++) {
+        var j = offset + i * 4;
+        W[i] = (((data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | data[j + 3]) >>> 0);
+      }
+      for (var i = 16; i < 64; i++) {
+        var s0 = (rotr32(W[i - 15], 7) ^ rotr32(W[i - 15], 18) ^ (W[i - 15] >>> 3)) >>> 0;
+        var s1 = (rotr32(W[i - 2], 17) ^ rotr32(W[i - 2], 19) ^ (W[i - 2] >>> 10)) >>> 0;
+        W[i] = (W[i - 16] + s0 + W[i - 7] + s1) >>> 0;
+      }
+      var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+      for (var i = 0; i < 64; i++) {
+        var S1 = (rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)) >>> 0;
+        var ch = ((e & f) ^ ((~e) & g)) >>> 0;
+        var temp1 = (h + S1 + ch + K[i] + W[i]) >>> 0;
+        var S0 = (rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)) >>> 0;
+        var maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+        var temp2 = (S0 + maj) >>> 0;
+        h = g; g = f; f = e; e = (d + temp1) >>> 0; d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+      }
+      H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+      H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+    }
+    return H.map(wordToHex).join('');
+  }
+
   async function sha256Hex(text) {
-    if (!globalThis.crypto || !crypto.subtle) throw new Error('crypto.subtle is unavailable');
-    var data = new TextEncoder().encode(String(text));
-    return bytesToHex(await crypto.subtle.digest('SHA-256', data));
+    text = String(text);
+    if (globalThis.crypto && crypto.subtle) return bytesToHex(await crypto.subtle.digest('SHA-256', textToUtf8Bytes(text)));
+    return sha256HexPureJs(text);
   }
 
   function stableStringify(value) {
@@ -5432,6 +5798,15 @@ function utf8Bytes(text) {
   try { return new TextEncoder().encode(String(text || '')).byteLength; } catch (_) { return String(text || '').length; }
 }
 
+function textToUtf8Bytes(text) {
+  text = String(text);
+  if (typeof TextEncoder === 'function') return new TextEncoder().encode(text);
+  const encoded = unescape(encodeURIComponent(text));
+  const bytes = new Uint8Array(encoded.length);
+  for (let i = 0; i < encoded.length; i++) bytes[i] = encoded.charCodeAt(i) & 255;
+  return bytes;
+}
+
 function bytesToHex(buffer) {
   const bytes = new Uint8Array(buffer);
   let out = '';
@@ -5439,10 +5814,73 @@ function bytesToHex(buffer) {
   return out;
 }
 
+function rotr32(value, bits) {
+  return ((value >>> bits) | (value << (32 - bits))) >>> 0;
+}
+
+function wordToHex(value) {
+  return (value >>> 0).toString(16).padStart(8, '0');
+}
+
+function sha256HexPureJs(text) {
+  const K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+  ];
+  const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  const bytes = textToUtf8Bytes(text);
+  const bitLen = bytes.length * 8;
+  const lenHi = Math.floor(bitLen / 0x100000000);
+  const lenLo = bitLen >>> 0;
+  const totalLen = Math.ceil((bytes.length + 9) / 64) * 64;
+  const data = new Uint8Array(totalLen);
+  data.set(bytes);
+  data[bytes.length] = 0x80;
+  data[totalLen - 8] = (lenHi >>> 24) & 255;
+  data[totalLen - 7] = (lenHi >>> 16) & 255;
+  data[totalLen - 6] = (lenHi >>> 8) & 255;
+  data[totalLen - 5] = lenHi & 255;
+  data[totalLen - 4] = (lenLo >>> 24) & 255;
+  data[totalLen - 3] = (lenLo >>> 16) & 255;
+  data[totalLen - 2] = (lenLo >>> 8) & 255;
+  data[totalLen - 1] = lenLo & 255;
+  const W = new Array(64);
+  for (let offset = 0; offset < data.length; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      const j = offset + i * 4;
+      W[i] = (((data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | data[j + 3]) >>> 0);
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = (rotr32(W[i - 15], 7) ^ rotr32(W[i - 15], 18) ^ (W[i - 15] >>> 3)) >>> 0;
+      const s1 = (rotr32(W[i - 2], 17) ^ rotr32(W[i - 2], 19) ^ (W[i - 2] >>> 10)) >>> 0;
+      W[i] = (W[i - 16] + s0 + W[i - 7] + s1) >>> 0;
+    }
+    let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+    for (let i = 0; i < 64; i++) {
+      const S1 = (rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)) >>> 0;
+      const ch = ((e & f) ^ ((~e) & g)) >>> 0;
+      const temp1 = (h + S1 + ch + K[i] + W[i]) >>> 0;
+      const S0 = (rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)) >>> 0;
+      const maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+      const temp2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + temp1) >>> 0; d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+    }
+    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+  }
+  return H.map(wordToHex).join('');
+}
+
 async function sha256Hex(text) {
-  if (!globalThis.crypto || !crypto.subtle) throw new Error('crypto.subtle is unavailable');
-  const data = new TextEncoder().encode(String(text));
-  return bytesToHex(await crypto.subtle.digest('SHA-256', data));
+  text = String(text);
+  if (globalThis.crypto && crypto.subtle) return bytesToHex(await crypto.subtle.digest('SHA-256', textToUtf8Bytes(text)));
+  return sha256HexPureJs(text);
 }
 
 function stableStringify(value) {
@@ -7577,116 +8015,6 @@ async function handleFrontendUpdate(req, res) {
   }
 }
 
-// server-plugins/cocktail-plus/src/browser-logs.ts
-var MAX_ENTRIES = 1e3;
-var MAX_INGEST_BATCH = 200;
-var MAX_FIELD_CHARS = 4e3;
-var nextId = 1;
-var entries = [];
-function clip(value, max = MAX_FIELD_CHARS) {
-  const text = String(value ?? "");
-  return text.length > max ? `${text.slice(0, max)}\u2026<truncated ${text.length - max}>` : text;
-}
-function normalizeArg(value) {
-  if (value === void 0) return "undefined";
-  if (value === null) return "null";
-  if (typeof value === "string") return clip(value);
-  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
-  if (value instanceof Error) return clip(`${value.name}: ${value.message}
-${value.stack || ""}`);
-  try {
-    return clip(JSON.stringify(value));
-  } catch {
-    try {
-      return clip(Object.prototype.toString.call(value));
-    } catch {
-      return "[unserializable]";
-    }
-  }
-}
-function normalizeEntry(raw, req) {
-  const args = Array.isArray(raw?.args) ? raw.args.map(normalizeArg) : [];
-  const message = raw?.message !== void 0 ? clip(raw.message) : clip(args.join(" "));
-  const level = ["debug", "log", "info", "warn", "error", "trace", "unhandledrejection", "window-error"].includes(String(raw?.level || "")) ? String(raw.level) : "log";
-  return {
-    id: nextId++,
-    receivedAt: Date.now(),
-    serverVersion: VERSION,
-    user: req?.user?.profile?.handle || "",
-    ip: req?.ip || req?.socket?.remoteAddress || "",
-    level,
-    message,
-    args,
-    stack: clip(raw?.stack || ""),
-    pageUrl: clip(raw?.pageUrl || raw?.url || ""),
-    source: clip(raw?.source || ""),
-    line: Number.isFinite(Number(raw?.line)) ? Number(raw.line) : null,
-    column: Number.isFinite(Number(raw?.column)) ? Number(raw.column) : null,
-    userAgent: clip(raw?.userAgent || req?.headers?.["user-agent"] || "", 1e3),
-    timestamp: Number.isFinite(Number(raw?.timestamp)) ? Number(raw.timestamp) : Date.now()
-  };
-}
-function pushEntry(entry) {
-  entries.push(entry);
-  while (entries.length > MAX_ENTRIES) entries.shift();
-}
-function ingestBrowserLogs(req) {
-  const body = req.body || {};
-  const rawEntries = Array.isArray(body.entries) ? body.entries : Array.isArray(body) ? body : [body];
-  const batch = rawEntries.slice(0, MAX_INGEST_BATCH).map((raw) => normalizeEntry(raw, req));
-  for (const entry of batch) pushEntry(entry);
-  return { ok: true, accepted: batch.length, total: entries.length, maxEntries: MAX_ENTRIES };
-}
-function ingestBrowserLogBeacon(req) {
-  let raw = null;
-  try {
-    if (req.query?.d) raw = JSON.parse(String(req.query.d));
-  } catch {
-    raw = null;
-  }
-  if (!raw) {
-    raw = {
-      level: req.query?.level || "log",
-      message: req.query?.message || "",
-      pageUrl: req.query?.pageUrl || "",
-      source: "beacon-query",
-      timestamp: Date.now()
-    };
-  }
-  const entry = normalizeEntry({ ...raw, source: raw.source || "early-beacon" }, req);
-  pushEntry(entry);
-  return { ok: true, accepted: 1, total: entries.length, maxEntries: MAX_ENTRIES };
-}
-function clearBrowserLogs() {
-  const removed = entries.length;
-  entries.splice(0, entries.length);
-  return { ok: true, removed };
-}
-function getBrowserLogs(limit = 200) {
-  const safeLimit = Math.max(1, Math.min(1e3, Number(limit) || 200));
-  const list = entries.slice(-safeLimit);
-  return {
-    ok: true,
-    version: VERSION,
-    total: entries.length,
-    maxEntries: MAX_ENTRIES,
-    entries: list,
-    text: formatBrowserLogs(list)
-  };
-}
-function formatBrowserLogs(list = entries) {
-  return list.map((entry) => {
-    const time = new Date(entry.receivedAt).toISOString();
-    const loc = entry.source ? ` ${entry.source}${entry.line !== null ? `:${entry.line}` : ""}${entry.column !== null ? `:${entry.column}` : ""}` : "";
-    const stack = entry.stack ? `
-${entry.stack}` : "";
-    return `[${time}] [${entry.level}]${loc} ${entry.message}${stack}`;
-  }).join("\n");
-}
-function getBrowserLogStatus() {
-  return { total: entries.length, maxEntries: MAX_ENTRIES, lastReceivedAt: entries.length ? entries[entries.length - 1].receivedAt : null };
-}
-
 // server-plugins/cocktail-plus/src/routes.ts
 function sendJson4(res, data) {
   res.setHeader(HEADER_PREFIX, VERSION);
@@ -7852,6 +8180,7 @@ function registerRoutes(router) {
 
 // server-plugins/cocktail-plus/src/index.ts
 async function init(router) {
+  installBackendLogCapture();
   if (config.autoPatchChatsEnoentGuard) {
     const patchResults = autoApplySourcePatches();
     for (const result of patchResults) {
@@ -7871,6 +8200,7 @@ async function init(router) {
   registerRoutes(router);
 }
 async function exit() {
+  uninstallBackendLogCapture();
   clearCacheStores();
 }
 export {

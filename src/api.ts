@@ -77,15 +77,15 @@ export async function fullProbe() {
 }
 
 
-export async function refreshBrowserLogs(limit = 200) {
+export async function refreshBrowserLogs(limit = 10_000) {
   if (!state.backend?.ok) return null;
   const result = await postJson<BrowserLogList>(`${API_PREFIX}/browser-logs/list`, { limit });
   state.browserLogs = result;
-  if (state.backend) state.backend.browserLogs = { total: result.total, maxEntries: result.maxEntries, lastReceivedAt: result.lastReceivedAt };
+  if (state.backend) state.backend.browserLogs = { total: result.total, maxEntries: result.maxEntries, maxFieldChars: result.maxFieldChars, lastReceivedAt: result.lastReceivedAt };
   return result;
 }
 
 export async function clearBrowserLogs() {
   await postJson(`${API_PREFIX}/browser-logs/clear`, {});
-  await refreshBrowserLogs();
+  await refreshBrowserLogs(10_000);
 }

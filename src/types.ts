@@ -120,6 +120,8 @@ export type SettingsGetStatus = {
 export type BrowserLogEntry = {
   id: number;
   receivedAt: number;
+  origin?: 'frontend' | 'backend';
+  clientId?: string;
   level: string;
   message: string;
   args?: string[];
@@ -130,11 +132,14 @@ export type BrowserLogEntry = {
   column?: number | null;
   userAgent?: string;
   user?: string;
+  backendPid?: number | null;
+  backendCwd?: string;
 };
 
 export type BrowserLogStatus = {
   total: number;
   maxEntries: number;
+  maxFieldChars?: number;
   lastReceivedAt: number | null;
 };
 
